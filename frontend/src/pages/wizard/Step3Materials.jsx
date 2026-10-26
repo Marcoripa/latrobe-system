@@ -161,11 +161,11 @@ export function Step3Materials({ itemsUsed = [], onChangeItemsUsed }) {
             Step 3 of 5
           </span>
           <h2 className="text-2xl sm:text-3xl font-black uppercase tracking-tight text-white mt-1">
-            AInventory Used
+            Inventory Used
           </h2>
         </div>
 
-        <button
+        {/* <button
           type="button"
           onClick={() => handleOpenAddMaterial(searchQuery)}
           className="
@@ -179,7 +179,7 @@ export function Step3Materials({ itemsUsed = [], onChangeItemsUsed }) {
         >
           <Plus className="w-5 h-5 stroke-[3]" aria-hidden="true" />
           <span>New Material</span>
-        </button>
+        </button> */}
       </div>
 
       {/* Research / Search Material Input */}
@@ -216,33 +216,6 @@ export function Step3Materials({ itemsUsed = [], onChangeItemsUsed }) {
             </button>
           )}
         </div>
-
-        {/* Quick prompt to add a non-existing material directly from the search bar */}
-        {searchQuery.trim() && !exactMatchExists && !showAddForm && (
-          <div className="p-4 rounded-xl bg-dark-surface border-2 border-primary flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <p className="text-xs font-black uppercase tracking-widest text-primary">
-                Not in catalog yet?
-              </p>
-              <p className="text-base font-black uppercase text-white">
-                Add &ldquo;{searchQuery.trim()}&rdquo; as a new material
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => handleOpenAddMaterial(searchQuery.trim())}
-              className="
-                min-h-touch px-4 py-2.5 rounded-xl
-                bg-primary text-black border-2 border-white
-                inline-flex items-center justify-center gap-2 shrink-0
-                font-black text-sm uppercase tracking-wider
-              "
-            >
-              <Plus className="w-5 h-5 stroke-[3]" aria-hidden="true" />
-              <span>Add Material</span>
-            </button>
-          </div>
-        )}
       </section>
 
       {/* Inline "Add New Material" Form */}

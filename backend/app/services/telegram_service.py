@@ -2,6 +2,7 @@ import html
 import json
 import logging
 import re
+import time
 from typing import Any
 
 import httpx
@@ -26,6 +27,8 @@ class TelegramService:
     """Asynchronous Telegram Bot API client for outbound alerts and inbound natural language queries."""
 
     BASE_URL = "https://api.telegram.org"
+    HISTORY_TTL_SECONDS = 900  # 15 minutes
+    MAX_HISTORY_TURNS = 6  # Last 6 messages (3 user + 3 model turns)
 
     def __init__(
         self,
@@ -46,6 +49,7 @@ class TelegramService:
         self._firestore = fs_service or firestore_service
         self._llm = llm or llm_service
         self._timeout = timeout
+        self._chat_history: dict[int, list[tuple[float, dict[str, Any]]]] = {}
 
     @property
     def is_configured(self) -> bool:
@@ -162,7 +166,103 @@ class TelegramService:
 
         return data
 
-    async def _handle_conversational_llm(self, text: str) -> str | None:
+    async def send_chat_action(
+        self,
+        *,
+        chat_id: str | int | None = None,
+        action: str = "typing",
+    ) -> dict[str, Any]:
+        """Send a chat action (e.g., 'typing') via the Telegram Bot API `sendChatAction` endpoint."""
+        target_chat_id = str(chat_id) if chat_id is not None else self._admin_chat_id
+        token = self._bot_token or settings.TELEGRAM_BOT_TOKEN
+        if not token or not target_chat_id:
+            return {"ok": False, "skipped": True, "reason": "telegram_not_configured"}
+
+        url = f"{self.BASE_URL}/bot{token}/sendChatAction"
+        payload: dict[str, Any] = {
+            "chat_id": target_chat_id,
+            "action": action,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(url, json=payload)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as exc:
+            logger.debug("Non-critical error sending Telegram chat action: %s", exc)
+        return {"ok": False}
+
+    async def edit_message(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        parse_mode: str | None = "HTML",
+    ) -> dict[str, Any]:
+        """Edit an existing message in place via the Telegram Bot API `editMessageText` endpoint."""
+        token = self._bot_token or settings.TELEGRAM_BOT_TOKEN
+        if not token:
+            return {"ok": False, "skipped": True, "reason": "telegram_not_configured"}
+
+        url = f"{self.BASE_URL}/bot{token}/editMessageText"
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": False,
+        }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.post(url, json=payload)
+        except httpx.RequestError as exc:
+            logger.error("Network error editing Telegram message: %s", exc)
+            raise TelegramNotificationError(
+                f"Network error communicating with Telegram API: {exc}"
+            ) from exc
+
+        if response.status_code != 200:
+            body = response.text
+            logger.error(
+                "Telegram editMessageText returned HTTP %d: %s", response.status_code, body
+            )
+            raise TelegramNotificationError(
+                f"Telegram API error (HTTP {response.status_code}): {body}"
+            )
+
+        data: dict[str, Any] = response.json()
+        if not data.get("ok"):
+            raise TelegramNotificationError(f"Telegram API error: {data}")
+
+        return data
+
+    def _get_recent_history(self, chat_id: int) -> list[dict[str, Any]]:
+        """Return non-expired conversation turns for the given chat_id."""
+        now = time.time()
+        entries = self._chat_history.get(chat_id, [])
+        valid = [
+            (ts, turn)
+            for ts, turn in entries
+            if now - ts <= self.HISTORY_TTL_SECONDS
+        ][-self.MAX_HISTORY_TURNS :]
+        self._chat_history[chat_id] = valid
+        return [turn for _, turn in valid]
+
+    def _append_history(self, chat_id: int, user_text: str, model_text: str) -> None:
+        """Append the latest user prompt and model response to the rolling chat history."""
+        now = time.time()
+        entries = self._chat_history.get(chat_id, [])
+        entries.append((now, {"role": "user", "parts": [{"text": user_text}]}))
+        entries.append((now, {"role": "model", "parts": [{"text": model_text}]}))
+        self._chat_history[chat_id] = entries[-self.MAX_HISTORY_TURNS :]
+
+    async def _handle_conversational_llm(
+        self, text: str, chat_id: int | None = None
+    ) -> str | None:
         """Handle open-ended conversational questions using the autonomous ReAct agent loop.
         Returns None if an error occurs, allowing graceful fallback to standard guidance.
         """
@@ -170,8 +270,13 @@ class TelegramService:
         if not cleaned_text:
             return None
 
+        history = self._get_recent_history(chat_id) if chat_id is not None else None
+
         try:
-            return await self._llm.run_agent(cleaned_text)
+            response = await self._llm.run_agent(cleaned_text, history=history)
+            if response and chat_id is not None:
+                self._append_history(chat_id, cleaned_text, response)
+            return response
         except Exception as exc:
             logger.exception("Error executing ReAct agent for Telegram message: %s", exc)
             return None
@@ -260,32 +365,46 @@ class TelegramService:
             return "\n".join(lines)
 
         if parsed.intent == "check_project_status" and parsed.project_identifier:
-            project = await self._firestore.find_project_by_name_or_id(
+            status_data = await self._firestore.get_project_status(
                 parsed.project_identifier
             )
-            if not project:
+            if not status_data.get("found"):
                 escaped_query = html.escape(parsed.project_identifier)
                 return f"Could not find a project matching <b>{escaped_query}</b>."
 
-            project_id = str(project.get("id"))
-            project_name = html.escape(str(project.get("name") or project_id))
-            client_name = html.escape(str(project.get("client_name") or "N/A"))
-            status_val = html.escape(str(project.get("status") or "active"))
+            project_id = html.escape(str(status_data.get("project_id") or ""))
+            project_name = html.escape(str(status_data.get("name") or project_id))
+            client_name = html.escape(str(status_data.get("client_name") or "N/A"))
+            status_val = html.escape(str(status_data.get("status") or "active"))
+            location = status_data.get("location")
+            total_hours = float(status_data.get("total_hours") or 0.0)
+            shifts_count = int(status_data.get("shifts_count") or 0)
+            unbilled_hours = float(status_data.get("unbilled_hours") or 0.0)
+            unbilled_shifts_count = int(status_data.get("unbilled_shifts_count") or 0)
+            items_used = status_data.get("items_used") or []
 
-            shifts = await self._firestore.get_project_shifts(
-                project_id, only_unbilled=False
+            lines = [
+                f"📋 <b>Project Status: {project_name}</b> (<code>{project_id}</code>)",
+                f"• <b>Client:</b> {client_name}",
+                f"• <b>Status:</b> {status_val}",
+            ]
+            if location:
+                lines.append(f"• <b>Location:</b> {html.escape(str(location))}")
+            lines.append(
+                f"• <b>Total Hours Logged:</b> {total_hours:g} hrs ({shifts_count} shifts)"
             )
-            total_hours = sum(float(s.get("hours") or 0.0) for s in shifts)
-            unbilled_shifts = [s for s in shifts if not s.get("invoiced")]
-            unbilled_hours = sum(float(s.get("hours") or 0.0) for s in unbilled_shifts)
+            lines.append(
+                f"• <b>Unbilled Hours:</b> {unbilled_hours:g} hrs ({unbilled_shifts_count} unbilled shifts)"
+            )
+            if items_used:
+                lines.append("\n🧰 <b>Materials Used:</b>")
+                for item in items_used:
+                    i_name = html.escape(str(item.get("name") or item.get("sku") or "Item"))
+                    i_sku = html.escape(str(item.get("sku") or ""))
+                    i_qty = float(item.get("total_quantity") or 0.0)
+                    lines.append(f"  • {i_name} (<code>{i_sku}</code>): <b>{i_qty:g}</b>")
 
-            return (
-                f"📋 <b>Project Status: {project_name}</b> (<code>{html.escape(project_id)}</code>)\n"
-                f"• <b>Client:</b> {client_name}\n"
-                f"• <b>Status:</b> {status_val}\n"
-                f"• <b>Total Hours Logged:</b> {total_hours:g} hrs ({len(shifts)} shifts)\n"
-                f"• <b>Unbilled Hours:</b> {unbilled_hours:g} hrs ({len(unbilled_shifts)} unbilled shifts)"
-            )
+            return "\n".join(lines)
 
         if parsed.intent == "list_active_projects":
             projects = await self._firestore.list_projects(
@@ -341,6 +460,8 @@ class TelegramService:
                 logger.error("Failed to send unauthorized notice to chat_id=%s: %s", chat_id, exc)
                 return {"ok": False, "reason": "unauthorized"}
 
+        ack_message_id: int | None = None
+
         try:
             # 1. Fast-path heuristic check for simple keywords & slash commands
             heuristic_intent = self._heuristic_parse_intent(text)
@@ -354,9 +475,20 @@ class TelegramService:
                 )
                 reply_text = await self._build_response_for_intent(heuristic_intent)
             else:
-                # 2. Conversational open-ended query -> Autonomous ReAct Agent Loop
+                # 2. Conversational open-ended query -> Immediate Acknowledgment + Typing Indicator + ReAct Agent
                 logger.info("Conversational query; invoking Autonomous ReAct Agent: %r", text)
-                llm_response = await self._handle_conversational_llm(text)
+                try:
+                    ack_response = await self.send_message(
+                        chat_id=chat_id,
+                        text="⏳ <i>Got it, I'm on it! Checking the records — I should get back to you in ~5–10 seconds...</i>",
+                        parse_mode="HTML",
+                    )
+                    ack_message_id = ack_response.get("result", {}).get("message_id")
+                    await self.send_chat_action(chat_id=chat_id, action="typing")
+                except Exception as ack_exc:
+                    logger.debug("Non-critical failure sending quick acknowledgment: %s", ack_exc)
+
+                llm_response = await self._handle_conversational_llm(text, chat_id=chat_id)
                 if llm_response:
                     reply_text = llm_response
                 else:
@@ -367,7 +499,7 @@ class TelegramService:
                 "Firestore error while processing Telegram message for chat_id=%s: %s",
                 chat_id,
                 exc,
-            )
+                )
             reply_text = (
                 "⚠️ Sorry, I encountered a database error while looking up that information. "
                 "Please try again shortly."
@@ -381,6 +513,22 @@ class TelegramService:
             reply_text = (
                 "⚠️ Sorry, something went wrong while processing your request."
             )
+
+        if ack_message_id is not None:
+            try:
+                return await self.edit_message(
+                    chat_id=chat_id,
+                    message_id=ack_message_id,
+                    text=reply_text,
+                    parse_mode="HTML",
+                )
+            except Exception as edit_exc:
+                logger.warning(
+                    "Failed to edit acknowledgment message %s in chat %s (%s); falling back to send_message.",
+                    ack_message_id,
+                    chat_id,
+                    edit_exc,
+                )
 
         try:
             return await self.send_message(

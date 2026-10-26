@@ -211,7 +211,7 @@ export function Step4Evidence({
             htmlFor="operator-voice-notes"
             className="text-sm font-black uppercase tracking-widest text-neutral-300"
           >
-            Voice Dictation / Field Notes
+            Field Notes
           </label>
           {isListening && (
             <span className="px-3 py-1 rounded-full bg-safety-red text-white text-xs font-black uppercase tracking-widest animate-pulse">
@@ -220,7 +220,7 @@ export function Step4Evidence({
           )}
         </div>
 
-        <FatButton
+        {/* <FatButton
           type="button"
           variant={isListening ? 'danger' : 'orange'}
           icon={isListening ? MicOff : Mic}
@@ -238,7 +238,7 @@ export function Step4Evidence({
             <AlertTriangle className="w-6 h-6 shrink-0 stroke-[2.5]" aria-hidden="true" />
             <span>{speechError}</span>
           </div>
-        )}
+        )} */}
 
         <textarea
           id="operator-voice-notes"

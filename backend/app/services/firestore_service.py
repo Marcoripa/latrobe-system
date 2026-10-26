@@ -238,28 +238,32 @@ class FirestoreService:
                 f"Failed to update project '{project_id}': {exc}"
             ) from exc
 
-    async def find_project_by_name_or_id(
+    async def find_matching_projects(
         self, identifier: str
-    ) -> dict[str, Any] | None:
-        """Resolve a project by exact Firestore document ID or case-insensitive name/client match."""
+    ) -> list[dict[str, Any]]:
+        """Find all matching projects by exact ID/name or partial name/client match.
+        Returns a list of 1 item on an unambiguous match, multiple items on an ambiguous match,
+        or an empty list if no project matches.
+        """
         clean_id = identifier.strip()
         if not clean_id:
-            return None
+            return []
 
         # 1. Try direct document ID lookup first
         direct = await self.get_project(clean_id)
         if direct:
-            return direct
+            return [direct]
 
-        # 2. Fallback to case-insensitive search across projects collection
-        def _search_projects() -> dict[str, Any] | None:
+        # 2. Search across projects collection
+        def _search_projects() -> list[dict[str, Any]]:
             needle = clean_id.lower()
-            # Strip trailing words like "project" or "job" for cleaner matching
             normalized_needle = (
                 needle.replace("project", "").replace("job", "").strip() or needle
             )
+            alnum_needle = re.sub(r"[^a-z0-9]", "", normalized_needle)
             projects_ref = self.db.collection("projects")
-            partial_match: dict[str, Any] | None = None
+            exact_matches: list[dict[str, Any]] = []
+            partial_matches: list[dict[str, Any]] = []
 
             for doc in projects_ref.stream():
                 data = doc.to_dict() or {}
@@ -267,24 +271,36 @@ class FirestoreService:
                 doc_name = str(data.get("name") or "").lower()
                 client_name = str(data.get("client_name") or "").lower()
                 doc_id_lower = doc.id.lower()
+                alnum_doc_name = re.sub(r"[^a-z0-9]", "", doc_name)
+                alnum_client_name = re.sub(r"[^a-z0-9]", "", client_name)
 
-                if needle in (doc_name, client_name, doc_id_lower) or (
-                    normalized_needle and normalized_needle == doc_name
-                ):
-                    return data
-
+                # Exact project name or ID match
                 if (
-                    normalized_needle
-                    and (
-                        normalized_needle in doc_name
-                        or normalized_needle in client_name
-                        or doc_name in normalized_needle
-                    )
-                    and partial_match is None
+                    needle in (doc_name, doc_id_lower)
+                    or (normalized_needle and normalized_needle == doc_name)
+                    or (alnum_needle and alnum_needle == alnum_doc_name)
                 ):
-                    partial_match = data
+                    exact_matches.append(data)
+                    continue
 
-            return partial_match
+                # Client name or partial project name match
+                if normalized_needle and (
+                    needle == client_name
+                    or normalized_needle in doc_name
+                    or normalized_needle in client_name
+                    or (doc_name and doc_name in normalized_needle)
+                    or (
+                        alnum_needle
+                        and (
+                            alnum_needle in alnum_doc_name
+                            or alnum_needle in alnum_client_name
+                            or (alnum_doc_name and alnum_doc_name in alnum_needle)
+                        )
+                    )
+                ):
+                    partial_matches.append(data)
+
+            return exact_matches if exact_matches else partial_matches
 
         try:
             return await asyncio.to_thread(_search_projects)
@@ -294,28 +310,156 @@ class FirestoreService:
                 f"Failed to search project '{identifier}': {exc}"
             ) from exc
 
+    async def find_project_by_name_or_id(
+        self, identifier: str
+    ) -> dict[str, Any] | None:
+        """Resolve a single project by exact Firestore document ID or case-insensitive name/client match."""
+        matches = await self.find_matching_projects(identifier)
+        return matches[0] if matches else None
+
     async def get_project_status(self, project_identifier: str) -> dict[str, Any]:
-        """Fetch project details, client info, and total / unbilled logged hours."""
-        project = await self.find_project_by_name_or_id(project_identifier)
-        if not project:
-            return {"found": False, "error": f"Project '{project_identifier}' not found."}
+        """Fetch comprehensive project details, client info, location, logged hours by category,
+        aggregated materials/items used, and field notes from Firestore.
+        Detects ambiguity when multiple projects match and provides candidate suggestions when none match.
+        """
+        matches = await self.find_matching_projects(project_identifier)
+        if not matches:
+            active_projects = await self.get_active_projects()
+            suggestions = [
+                {
+                    "project_id": str(p.get("id")),
+                    "name": p.get("name"),
+                    "client_name": p.get("client_name"),
+                }
+                for p in active_projects[:15]
+            ]
+            return {
+                "found": False,
+                "ambiguous": False,
+                "error": f"Project '{project_identifier}' was not found.",
+                "available_projects": suggestions,
+                "instruction": (
+                    "Inform the user that the requested project was not found. "
+                    "If any project in `available_projects` looks similar, ask if they meant that one."
+                ),
+            }
+
+        if len(matches) > 1:
+            candidates = [
+                {
+                    "project_id": str(m.get("id")),
+                    "name": m.get("name"),
+                    "client_name": m.get("client_name"),
+                    "status": m.get("status", "Active"),
+                    "location": m.get("location"),
+                }
+                for m in matches
+            ]
+            return {
+                "found": False,
+                "ambiguous": True,
+                "query": project_identifier,
+                "candidates": candidates,
+                "instruction": (
+                    f"Multiple projects ({len(candidates)}) matched '{project_identifier}'. "
+                    "Do NOT guess which one the user wants. List these candidate projects clearly "
+                    "and ask the user to clarify which specific project they are referring to."
+                ),
+            }
+
+        project = matches[0]
 
         project_id = str(project.get("id"))
         shifts = await self.get_project_shifts(project_id, only_unbilled=False)
-        total_hours = sum(float(s.get("hours") or 0.0) for s in shifts)
-        unbilled_shifts = [s for s in shifts if not s.get("invoiced")]
-        unbilled_hours = sum(float(s.get("hours") or 0.0) for s in unbilled_shifts)
+
+        total_hours = 0.0
+        unbilled_hours = 0.0
+        billed_hours = 0.0
+        unbilled_shifts_count = 0
+        hours_by_category: dict[str, float] = {}
+        items_map: dict[str, dict[str, Any]] = {}
+        field_notes: list[dict[str, Any]] = []
+
+        for s in shifts:
+            hrs = float(s.get("hours") or 0.0)
+            cat = str(s.get("category") or "On-Site")
+            is_invoiced = bool(s.get("invoiced"))
+
+            total_hours += hrs
+            hours_by_category[cat] = round(hours_by_category.get(cat, 0.0) + hrs, 2)
+
+            if is_invoiced:
+                billed_hours += hrs
+            else:
+                unbilled_hours += hrs
+                unbilled_shifts_count += 1
+
+            # Aggregate items/materials used across shifts
+            for item in s.get("items_used") or []:
+                if not isinstance(item, dict):
+                    continue
+                sku = str(
+                    item.get("sku")
+                    or item.get("item_id")
+                    or item.get("name")
+                    or "UNKNOWN"
+                ).strip()
+                qty = float(item.get("quantity") or 0.0)
+                if qty <= 0:
+                    continue
+                if sku not in items_map:
+                    items_map[sku] = {
+                        "item_id": item.get("item_id"),
+                        "sku": sku,
+                        "name": str(item.get("name") or sku),
+                        "total_quantity": 0.0,
+                        "unbilled_quantity": 0.0,
+                    }
+                items_map[sku]["total_quantity"] = round(
+                    items_map[sku]["total_quantity"] + qty, 2
+                )
+                if not is_invoiced:
+                    items_map[sku]["unbilled_quantity"] = round(
+                        items_map[sku]["unbilled_quantity"] + qty, 2
+                    )
+
+            # Collect operator field notes
+            note_text = str(s.get("notes") or "").strip()
+            if note_text and note_text.lower() != "none":
+                created_at = s.get("created_at")
+                ts_str = (
+                    created_at.isoformat()
+                    if hasattr(created_at, "isoformat")
+                    else str(created_at or "")
+                )
+                field_notes.append(
+                    {
+                        "date": ts_str,
+                        "category": cat,
+                        "hours": hrs,
+                        "note": note_text,
+                        "invoiced": is_invoiced,
+                    }
+                )
 
         return {
             "found": True,
             "project_id": project_id,
+            "qbo_id": project.get("qbo_id"),
             "name": str(project.get("name") or project_id),
             "client_name": str(project.get("client_name") or "N/A"),
             "status": str(project.get("status") or "active"),
-            "total_hours": total_hours,
+            "location": project.get("location") or project.get("address"),
+            "hourly_rate": project.get("hourly_rate"),
+            "total_hours": round(total_hours, 2),
+            "unbilled_hours": round(unbilled_hours, 2),
+            "billed_hours": round(billed_hours, 2),
+            "hours_by_category": hours_by_category,
             "shifts_count": len(shifts),
-            "unbilled_hours": unbilled_hours,
-            "unbilled_shifts_count": len(unbilled_shifts),
+            "unbilled_shifts_count": unbilled_shifts_count,
+            "items_used": list(items_map.values()),
+            "items_used_count": len(items_map),
+            "field_notes": field_notes[-20:],
         }
 
     async def list_active_projects(self) -> dict[str, Any]:

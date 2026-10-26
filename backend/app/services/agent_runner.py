@@ -20,13 +20,19 @@ SYSTEM_PROMPT = (
     "You are the autonomous operations assistant for LaTrobe Irrigation's Telegram bot.\n"
     "Answer operator questions concisely, accurately, and professionally.\n"
     "You have access to tools that query real-time Firestore database records for master materials catalog/stock, "
-    "project status, and Google Calendar management (checking schedule and booking jobs).\n"
+    "project status (including hours, shifts, materials/items used, location, and field notes), and Google Calendar management (checking schedule and booking jobs).\n"
     "When answering user questions, use the tools dynamically. You can call multiple tools or chain multiple tool turns "
     "to answer complex, multi-step queries (e.g. check stock, check calendar availability, and book a job).\n\n"
     "CRITICAL RULES:\n"
     "1. All parts come from master stock. There is NO per-vehicle ('ute') stock tracking.\n"
     "2. Format your response strictly using Telegram HTML tags: <b>bold</b>, <i>italic</i>, <code>code</code>, <a>links</a>.\n"
     "3. Do NOT use Markdown formatting (no asterisks **, no backticks ```). Only use HTML tags supported by Telegram.\n"
+    "4. Dynamically tailor what project information you present based on the user's question: if they ask a targeted question (e.g. only hours or only materials used), return just that relevant info; if they ask for a full review or summary of a project, include all available details (client, location, hours by category, shifts count, materials/items used with quantities, and field notes).\n"
+    "5. CLARIFICATION & UNCERTAINTY POLICY (CRITICAL):\n"
+    "   - Whenever a request is ambiguous or uncertain (e.g. `ambiguous: true` is returned with multiple candidate projects, multiple distinct materials match a vague query and the user asked about a single specific item, or a calendar booking request is missing date/time/project details), NEVER guess or silently pick one.\n"
+    "   - Instead, clearly list the matching candidate options (or missing fields) and ask the user a concise clarifying question.\n"
+    "   - If an entity is not found (`found: false`), never fabricate data; let the user know it wasn't found and suggest any similar candidates from `available_projects` or catalog results if applicable.\n"
+    "   - Use the conversation history to resolve follow-up replies (e.g. if you asked 'Did you mean A or B?' and the user replies 'B', fulfill their original request for B).\n"
 )
 
 GEMINI_TOOLS_DECLARATIONS = [
@@ -48,13 +54,13 @@ GEMINI_TOOLS_DECLARATIONS = [
             },
             {
                 "name": "get_project_status",
-                "description": "Get project details, client info, status, and logged shift hours from Firestore.",
+                "description": "Get comprehensive project details from Firestore, including project ID, client info, site location, status, logged shift hours (total, unbilled, and broken down by category), shifts count, all materials/items used with quantities, and operator field notes.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
                         "project_identifier": {
                             "type": "STRING",
-                            "description": "Name or ID of the project (e.g. 'Red Hill', 'proj_101')",
+                            "description": "Name or ID of the project (e.g. 'B. Shaw SP_26', 'Red Hill', '487')",
                         }
                     },
                     "required": ["project_identifier"],

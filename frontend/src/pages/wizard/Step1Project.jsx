@@ -270,7 +270,7 @@ export function Step1Project({ selectedProject, onSelectProject }) {
           </h2>
         </div>
 
-        <button
+        {/* <button
           type="button"
           onClick={handleOpenModal}
           className="
@@ -284,7 +284,7 @@ export function Step1Project({ selectedProject, onSelectProject }) {
         >
           <Plus className="w-6 h-6 stroke-[3]" aria-hidden="true" />
           <span>New Project</span>
-        </button>
+        </button> */}
       </div>
 
       {loading && (

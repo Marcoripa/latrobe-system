@@ -346,4 +346,3 @@ All `/api/v1/*` endpoints require a `Bearer <Firebase_ID_Token>` header.
 
 
 
-curl -X POST "https://api.telegram.org/bot8986649682:AAHu_L05mvNwFX7C5CsvbRmHiqa6DNx8uS0/setWebhook?url=https://latrobe-brain-api-339213924120.australia-southeast2.run.app/webhook/telegram/bmtFoTNmQly58imx5DgZLGxJQgHEO1SnP3jbqv86qcY"
