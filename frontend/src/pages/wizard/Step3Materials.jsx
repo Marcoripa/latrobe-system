@@ -5,8 +5,8 @@ import {
   Search,
   X,
   Plus,
-  WifiOff,
-  Database,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import { QuickChip } from '../../components/ui/QuickChip';
 import { Stepper } from '../../components/ui/Stepper';
@@ -19,6 +19,7 @@ import {
 } from '../../lib/offlineQueue';
 
 const UNIT_OPTIONS = ['Units', 'Meters', 'Rolls', 'Lengths'];
+const QUICK_PICK_LIMIT = 6;
 
 /**
  * Step 3: Log Materials
@@ -35,6 +36,7 @@ export function Step3Materials({ itemsUsed = [], onChangeItemsUsed }) {
   );
   const [searching, setSearching] = useState(false);
   const [searchSource, setSearchSource] = useState('offline-cache');
+  const [showAllCatalog, setShowAllCatalog] = useState(false);
 
   // New material creation state
   const [showAddForm, setShowAddForm] = useState(false);
@@ -312,10 +314,40 @@ export function Step3Materials({ itemsUsed = [], onChangeItemsUsed }) {
 
       {/* Top Section: Matching / Quick-Add Material QuickChips */}
       <section className="space-y-3">
-        <div className="text-sm font-black uppercase tracking-widest text-neutral-300">
-          {searchQuery.trim()
-            ? `Matching Materials (${catalogResults.length})`
-            : 'Quick-Add Field Stock'}
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-black uppercase tracking-widest text-neutral-300">
+            {searchQuery.trim()
+              ? `Matching Materials (${catalogResults.length})`
+              : showAllCatalog
+                ? `All Field Stock (${catalogResults.length})`
+                : `Quick-Add Field Stock (Top ${Math.min(QUICK_PICK_LIMIT, catalogResults.length)})`}
+          </div>
+
+          {!searchQuery.trim() && catalogResults.length > QUICK_PICK_LIMIT && (
+            <button
+              type="button"
+              onClick={() => setShowAllCatalog((prev) => !prev)}
+              className="
+                px-3 py-1.5 rounded-lg
+                bg-dark-surface text-primary border-2 border-primary
+                inline-flex items-center gap-1.5
+                font-black text-xs uppercase tracking-wider
+                hover:bg-primary hover:text-black transition-colors
+              "
+            >
+              {showAllCatalog ? (
+                <>
+                  <span>Show Top {QUICK_PICK_LIMIT}</span>
+                  <ChevronUp className="w-4 h-4 stroke-[3]" aria-hidden="true" />
+                </>
+              ) : (
+                <>
+                  <span>Show All ({catalogResults.length})</span>
+                  <ChevronDown className="w-4 h-4 stroke-[3]" aria-hidden="true" />
+                </>
+              )}
+            </button>
+          )}
         </div>
 
         {catalogResults.length === 0 ? (
@@ -335,20 +367,25 @@ export function Step3Materials({ itemsUsed = [], onChangeItemsUsed }) {
             )}
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {catalogResults.map((material) => {
-              const matId = material.id || material.item_id;
-              return (
-                <QuickChip
-                  key={matId}
-                  label={material.name}
-                  icon={PackagePlus}
-                  selected={isItemSelected(matId)}
-                  onClick={() => handleToggleCatalogItem(material)}
-                  className="w-full justify-start"
-                />
-              );
-            })}
+          <div className="max-h-64 sm:max-h-72 overflow-y-auto pr-1 rounded-xl">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              {(searchQuery.trim() || showAllCatalog
+                ? catalogResults
+                : catalogResults.slice(0, QUICK_PICK_LIMIT)
+              ).map((material) => {
+                const matId = material.id || material.item_id;
+                return (
+                  <QuickChip
+                    key={matId}
+                    label={material.name}
+                    icon={PackagePlus}
+                    selected={isItemSelected(matId)}
+                    onClick={() => handleToggleCatalogItem(material)}
+                    className="w-full justify-start"
+                  />
+                );
+              })}
+            </div>
           </div>
         )}
       </section>

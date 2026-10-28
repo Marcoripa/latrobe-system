@@ -1,8 +1,10 @@
+import asyncio
 import html
 import json
 import logging
 import re
 import time
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -50,6 +52,16 @@ class TelegramService:
         self._llm = llm or llm_service
         self._timeout = timeout
         self._chat_history: dict[int, list[tuple[float, dict[str, Any]]]] = {}
+        self._http_client: httpx.AsyncClient | None = None
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Return a persistent httpx.AsyncClient for connection pooling."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=self._timeout,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
+        return self._http_client
 
     @property
     def is_configured(self) -> bool:
@@ -91,7 +103,7 @@ class TelegramService:
                     params={"url": webhook_target_url},
                     json={
                         "url": webhook_target_url,
-                        "allowed_updates": ["message", "edited_message"],
+                        "allowed_updates": ["message", "edited_message", "callback_query"],
                         "drop_pending_updates": False,
                     },
                 )
@@ -142,8 +154,8 @@ class TelegramService:
             payload["reply_markup"] = reply_markup
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(url, json=payload)
+            client = self._get_http_client()
+            response = await client.post(url, json=payload)
         except httpx.RequestError as exc:
             logger.error("Network error sending Telegram message: %s", exc)
             raise TelegramNotificationError(
@@ -185,8 +197,8 @@ class TelegramService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.post(url, json=payload)
+            client = self._get_http_client()
+            response = await client.post(url, json=payload, timeout=5.0)
             if response.status_code == 200:
                 return response.json()
         except Exception as exc:
@@ -200,6 +212,7 @@ class TelegramService:
         message_id: int,
         text: str,
         parse_mode: str | None = "HTML",
+        reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Edit an existing message in place via the Telegram Bot API `editMessageText` endpoint."""
         token = self._bot_token or settings.TELEGRAM_BOT_TOKEN
@@ -215,10 +228,12 @@ class TelegramService:
         }
         if parse_mode:
             payload["parse_mode"] = parse_mode
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(url, json=payload)
+            client = self._get_http_client()
+            response = await client.post(url, json=payload)
         except httpx.RequestError as exc:
             logger.error("Network error editing Telegram message: %s", exc)
             raise TelegramNotificationError(
@@ -239,6 +254,173 @@ class TelegramService:
             raise TelegramNotificationError(f"Telegram API error: {data}")
 
         return data
+
+    async def edit_message_reply_markup(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: int,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Instantly update or remove inline keyboard buttons via Telegram's `editMessageReplyMarkup` endpoint."""
+        token = self._bot_token or settings.TELEGRAM_BOT_TOKEN
+        if not token:
+            return {"ok": False, "skipped": True, "reason": "telegram_not_configured"}
+
+        url = f"{self.BASE_URL}/bot{token}/editMessageReplyMarkup"
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "reply_markup": reply_markup if reply_markup is not None else {"inline_keyboard": []},
+        }
+
+        try:
+            client = self._get_http_client()
+            response = await client.post(url, json=payload, timeout=5.0)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as exc:
+            logger.debug("Non-critical error editing message reply markup: %s", exc)
+        return {"ok": False}
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> dict[str, Any]:
+        """Acknowledge a callback_query button press via Telegram's `answerCallbackQuery` endpoint."""
+        token = self._bot_token or settings.TELEGRAM_BOT_TOKEN
+        if not token or not callback_query_id:
+            return {"ok": False, "skipped": True}
+
+        url = f"{self.BASE_URL}/bot{token}/answerCallbackQuery"
+        payload: dict[str, Any] = {
+            "callback_query_id": callback_query_id,
+            "show_alert": show_alert,
+        }
+        if text:
+            payload["text"] = text[:200]
+
+        try:
+            client = self._get_http_client()
+            response = await client.post(url, json=payload, timeout=5.0)
+            if response.status_code == 200:
+                return response.json()
+        except Exception as exc:
+            logger.debug("Non-critical error answering callback query: %s", exc)
+        return {"ok": False}
+
+    @staticmethod
+    def build_booking_approval_keyboard(proposal_id: str) -> dict[str, Any]:
+        """Construct the 3-option Human-in-the-Loop Inline Keyboard for booking proposals."""
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "✅ Confirm & Notify",
+                        "callback_data": f"confirm_notify|{proposal_id}",
+                    },
+                    {
+                        "text": "🤫 Confirm (Silent)",
+                        "callback_data": f"confirm_silent|{proposal_id}",
+                    },
+                ],
+                [
+                    {
+                        "text": "❌ Reject",
+                        "callback_data": f"reject|{proposal_id}",
+                    }
+                ],
+            ]
+        }
+
+    @staticmethod
+    def format_proposed_slot(start_iso: str, end_iso: str) -> str:
+        """Format ISO 8601 start/end timestamps into a readable string, e.g. 'Wed, 28 Oct 2026 at 09:00 to 11:00'."""
+        try:
+            start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            date_str = start_dt.strftime("%a, %d %b %Y")
+            start_time = start_dt.strftime("%H:%M")
+            end_time = end_dt.strftime("%H:%M")
+            if start_dt.date() == end_dt.date():
+                return f"{date_str} at {start_time} to {end_time}"
+            end_date_str = end_dt.strftime("%a, %d %b %Y")
+            return f"{date_str} at {start_time} to {end_date_str} at {end_time}"
+        except Exception:
+            return f"{start_iso} to {end_iso}"
+
+    def format_booking_proposal_text(
+        self,
+        proposal: dict[str, Any],
+        final_status: str | None = None,
+    ) -> str:
+        """Render the HTML text for a Telegram booking approval card."""
+        client_flag = str(proposal.get("customer_flag") or "MATCHED CLIENT")
+        customer_name = html.escape(str(proposal.get("customer_name") or "NEW/UNKNOWN CLIENT"))
+        customer_id = html.escape(str(proposal.get("qbo_customer_id") or "N/A"))
+        overdue = float(proposal.get("overdue_balance") or 0.0)
+        source = html.escape(str(proposal.get("source") or "unknown").upper())
+        sender_id = html.escape(str(proposal.get("sender_id") or "unknown"))
+        project_name = html.escape(str(proposal.get("project_name") or "Unassigned"))
+        project_id = html.escape(str(proposal.get("project_id") or "unassigned"))
+        urgency = html.escape(str(proposal.get("urgency") or "normal").upper())
+        summary = html.escape(str(proposal.get("summary") or "Service Booking"))
+        job_desc = html.escape(str(proposal.get("job_description") or ""))
+        raw_start = str(proposal.get("start_iso") or "")
+        raw_end = str(proposal.get("end_iso") or "")
+        readable_slot = html.escape(self.format_proposed_slot(raw_start, raw_end))
+        location = html.escape(str(proposal.get("location") or "Not specified"))
+        raw_text = html.escape(str(proposal.get("raw_text") or ""))
+
+        if client_flag == "NEW/UNKNOWN CLIENT":
+            identity_line = f"⚠️ <b>Client:</b> <code>NEW/UNKNOWN CLIENT</code>"
+        else:
+            balance_badge = (
+                f" (⚠️ <b>Overdue/Balance: ${overdue:,.2f}</b>)"
+                if overdue > 0
+                else " (Balance: $0.00)"
+            )
+            identity_line = (
+                f"<b>Client:</b> {customer_name} (QBO ID: <code>{customer_id}</code>){balance_badge}"
+            )
+
+        lines = [
+            "📅 <b>New Booking Proposal</b>",
+            "",
+            identity_line,
+            f"<b>Channel:</b> {source} (<code>{sender_id}</code>)",
+            f"<b>Project:</b> {project_name} (<code>{project_id}</code>)",
+            f"<b>Urgency:</b> {urgency}",
+            f"<b>Summary:</b> {summary}",
+            # f"<b>Job Description:</b> {job_desc}",
+            f"<b>Location:</b> {location}",
+            f"<b>Proposed Slot:</b> <code>{readable_slot}</code>",
+            "",
+            f"💬 <i>\"{raw_text}\"</i>",
+        ]
+
+        if final_status:
+            lines.extend(["", f"<b>Status:</b> {final_status}"])
+
+        return "\n".join(lines)
+
+    async def send_booking_proposal_card(
+        self,
+        proposal_id: str,
+        proposal: dict[str, Any],
+        chat_id: str | int | None = None,
+    ) -> dict[str, Any]:
+        """Format and send an interactive booking proposal card with Confirm/Silent/Reject buttons."""
+        message_text = self.format_booking_proposal_text(proposal)
+        reply_markup = self.build_booking_approval_keyboard(proposal_id)
+        return await self.send_message(
+            text=message_text,
+            chat_id=chat_id,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
 
     def _get_recent_history(self, chat_id: int) -> list[dict[str, Any]]:
         """Return non-expired conversation turns for the given chat_id."""
@@ -475,20 +657,30 @@ class TelegramService:
                 )
                 reply_text = await self._build_response_for_intent(heuristic_intent)
             else:
-                # 2. Conversational open-ended query -> Immediate Acknowledgment + Typing Indicator + ReAct Agent
+                # 2. Conversational open-ended query -> Concurrent Acknowledgment + Typing Indicator + ReAct Agent
                 logger.info("Conversational query; invoking Autonomous ReAct Agent: %r", text)
-                try:
-                    ack_response = await self.send_message(
-                        chat_id=chat_id,
-                        text="⏳ <i>Got it, I'm on it! Checking the records — I should get back to you in ~5–10 seconds...</i>",
-                        parse_mode="HTML",
-                    )
-                    ack_message_id = ack_response.get("result", {}).get("message_id")
-                    await self.send_chat_action(chat_id=chat_id, action="typing")
-                except Exception as ack_exc:
-                    logger.debug("Non-critical failure sending quick acknowledgment: %s", ack_exc)
 
-                llm_response = await self._handle_conversational_llm(text, chat_id=chat_id)
+                async def _send_quick_ack() -> int | None:
+                    try:
+                        ack_response, _ = await asyncio.gather(
+                            self.send_message(
+                                chat_id=chat_id,
+                                text="⏳ <i>I'm on it! Checking the records...</i>",
+                                parse_mode="HTML",
+                            ),
+                            self.send_chat_action(chat_id=chat_id, action="typing"),
+                            return_exceptions=True,
+                        )
+                        if isinstance(ack_response, dict):
+                            return ack_response.get("result", {}).get("message_id")
+                    except Exception as ack_exc:
+                        logger.debug("Non-critical failure sending quick acknowledgment: %s", ack_exc)
+                    return None
+
+                ack_message_id, llm_response = await asyncio.gather(
+                    _send_quick_ack(),
+                    self._handle_conversational_llm(text, chat_id=chat_id),
+                )
                 if llm_response:
                     reply_text = llm_response
                 else:

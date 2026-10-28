@@ -40,6 +40,17 @@ class TelegramMessage(BaseModel):
     text: str | None = Field(default=None, description="UTF-8 text of the incoming message")
 
 
+class TelegramCallbackQuery(BaseModel):
+    """Telegram callback_query object triggered when an inline keyboard button is pressed."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+    id: str
+    from_user: TelegramUser | None = Field(default=None, alias="from")
+    message: TelegramMessage | None = None
+    data: str | None = Field(default=None, description="Callback data associated with the button")
+
+
 class TelegramUpdate(BaseModel):
     """Top-level Telegram Webhook Update payload."""
 
@@ -48,6 +59,7 @@ class TelegramUpdate(BaseModel):
     update_id: int | None = None
     message: TelegramMessage | None = None
     edited_message: TelegramMessage | None = None
+    callback_query: TelegramCallbackQuery | None = None
 
     @property
     def effective_message(self) -> TelegramMessage | None:

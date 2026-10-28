@@ -61,6 +61,12 @@ class QuickBooksService:
             return f"https://app.qbo.intuit.com/app/invoice?txnId={qbo_invoice_id}"
         return f"https://app.sandbox.qbo.intuit.com/app/invoice?txnId={qbo_invoice_id}"
 
+    def get_bill_review_url(self, qbo_bill_id: str) -> str:
+        """Return the QuickBooks Online UI URL where a manager can review the bill."""
+        if settings.QUICKBOOKS_ENVIRONMENT == "production":
+            return f"https://app.qbo.intuit.com/app/bill?txnId={qbo_bill_id}"
+        return f"https://app.sandbox.qbo.intuit.com/app/bill?txnId={qbo_bill_id}"
+
     async def _ensure_tokens_loaded(self, force: bool = False) -> None:
         """Load the latest persisted tokens from Firestore if available."""
         if self._tokens_loaded_from_store and not force:
@@ -287,6 +293,35 @@ class QuickBooksService:
                 or f"Customer {qbo_id}"
             ).strip()
 
+            email_obj = cust.get("PrimaryEmailAddr") or {}
+            email_val = (
+                str(email_obj.get("Address") or "").strip()
+                if isinstance(email_obj, dict)
+                else None
+            ) or None
+
+            phone_obj = cust.get("PrimaryPhone") or {}
+            phone_val = (
+                str(phone_obj.get("FreeFormNumber") or "").strip()
+                if isinstance(phone_obj, dict)
+                else None
+            ) or None
+
+            mobile_obj = cust.get("Mobile") or {}
+            mobile_val = (
+                str(mobile_obj.get("FreeFormNumber") or "").strip()
+                if isinstance(mobile_obj, dict)
+                else None
+            ) or None
+
+            raw_balance = cust.get("BalanceWithJobs")
+            if raw_balance is None:
+                raw_balance = cust.get("Balance")
+            try:
+                balance_val = round(float(raw_balance), 2) if raw_balance is not None else 0.0
+            except (TypeError, ValueError):
+                balance_val = 0.0
+
             cleaned_customers.append(
                 {
                     "qbo_id": qbo_id,
@@ -300,6 +335,10 @@ class QuickBooksService:
                     "parent_name": parent_name,
                     "ship_addr": cust.get("ShipAddr"),
                     "bill_addr": cust.get("BillAddr"),
+                    "email": email_val,
+                    "phone": phone_val,
+                    "mobile": mobile_val,
+                    "overdue_balance": balance_val,
                 }
             )
 
@@ -358,6 +397,152 @@ class QuickBooksService:
             len(cleaned_items),
         )
         return cleaned_items
+
+    async def fetch_active_vendors(self) -> list[dict[str, Any]]:
+        """Fetch all active Vendors (Suppliers) from QuickBooks Online.
+
+        Executes:
+            `SELECT * FROM Vendor WHERE Active = true`
+
+        Returns:
+            A cleaned list of dicts with keys:
+            `vendor_id`, `display_name`, `email_address`, `email_domain`, and `email_addresses`.
+        """
+        query = "SELECT * FROM Vendor WHERE Active = true"
+        raw_vendors = await self._query_all(query, entity_key="Vendor")
+
+        cleaned_vendors: list[dict[str, Any]] = []
+        for vendor in raw_vendors:
+            vendor_id = str(vendor.get("Id") or "").strip()
+            if not vendor_id:
+                continue
+
+            display_name = str(
+                vendor.get("DisplayName")
+                or vendor.get("CompanyName")
+                or vendor.get("PrintOnCheckName")
+                or f"Vendor {vendor_id}"
+            ).strip()
+
+            email_obj = vendor.get("PrimaryEmailAddr") or {}
+            raw_email = (
+                str(email_obj.get("Address") or "").strip()
+                if isinstance(email_obj, dict)
+                else ""
+            )
+
+            # A QBO vendor email field may occasionally contain multiple comma/semicolon-separated emails
+            email_list: list[str] = []
+            if raw_email:
+                for part in raw_email.replace(";", ",").split(","):
+                    cleaned_part = part.strip().lower()
+                    if "@" in cleaned_part:
+                        email_list.append(cleaned_part)
+
+            primary_email: str | None = email_list[0] if email_list else None
+            email_domain: str | None = None
+            if primary_email and "@" in primary_email:
+                email_domain = primary_email.split("@", 1)[1].strip().lower() or None
+
+            cleaned_vendors.append(
+                {
+                    "vendor_id": vendor_id,
+                    "display_name": display_name,
+                    "company_name": str(vendor.get("CompanyName") or "").strip() or None,
+                    "email_address": primary_email,
+                    "email_domain": email_domain,
+                    "email_addresses": email_list,
+                }
+            )
+
+        logger.info(
+            "Fetched %d active Vendor/Supplier record(s) from QuickBooks Online.",
+            len(cleaned_vendors),
+        )
+        return cleaned_vendors
+
+    async def create_bill(
+        self,
+        *,
+        vendor_id: str,
+        total_amount_inc_gst: float,
+        gst_amount: float = 0.0,
+        invoice_number: str | None = None,
+        issue_date: str | None = None,
+        due_date: str | None = None,
+        purchase_order_ref: str | None = None,
+        description: str | None = None,
+        expense_account_id: str = "5",
+    ) -> dict[str, Any]:
+        """Construct and send a POST request to QuickBooks `/v3/company/{realm_id}/bill`
+        creating an Open/Draft Bill mapped to the specified Vendor ID.
+        """
+        if not vendor_id:
+            raise ValueError("vendor_id (QuickBooks VendorRef) is required.")
+
+        total_inc = round(float(total_amount_inc_gst or 0.0), 2)
+        gst_val = round(float(gst_amount or 0.0), 2)
+        tax_code_id = "2" if gst_val > 0 else "3"  # "2" = GST on non-capital (10%), "3" = GST-free non-capital
+
+        line_desc_parts: list[str] = []
+        if description:
+            line_desc_parts.append(description.strip())
+        if invoice_number:
+            line_desc_parts.append(f"Inv #{invoice_number}")
+        if purchase_order_ref:
+            line_desc_parts.append(f"PO Ref: {purchase_order_ref}")
+        line_description = " | ".join(line_desc_parts) or "Supplier Invoice (AI Extracted)"
+
+        bill_payload: dict[str, Any] = {
+            "VendorRef": {"value": str(vendor_id)},
+            "GlobalTaxCalculation": "TaxInclusive",
+            "Line": [
+                {
+                    "LineNum": 1,
+                    "Description": line_description[:4000],
+                    "Amount": total_inc,
+                    "DetailType": "AccountBasedExpenseLineDetail",
+                    "AccountBasedExpenseLineDetail": {
+                        "AccountRef": {"value": str(expense_account_id)},
+                        "BillableStatus": "NotBillable",
+                        "TaxCodeRef": {"value": tax_code_id},
+                    },
+                }
+            ],
+        }
+
+        if invoice_number:
+            # QBO DocNumber max length is 21 characters
+            bill_payload["DocNumber"] = str(invoice_number).strip()[:21]
+
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        bill_payload["TxnDate"] = (issue_date or "").strip() or today_str
+        if due_date and str(due_date).strip():
+            bill_payload["DueDate"] = str(due_date).strip()
+
+        note_lines = [
+            f"AI-Extracted Supplier Bill (Total inc GST: ${total_inc:,.2f}, GST: ${gst_val:,.2f})"
+        ]
+        if invoice_number:
+            note_lines.append(f"Invoice #: {invoice_number}")
+        if purchase_order_ref:
+            note_lines.append(f"PO Ref: {purchase_order_ref}")
+        bill_payload["PrivateNote"] = "\n".join(note_lines)[:4000]
+
+        endpoint = f"/v3/company/{self._realm_id}/bill"
+        response_data = await self._request(
+            "POST", endpoint, json_payload=bill_payload
+        )
+
+        bill_obj = response_data.get("Bill", response_data)
+        qbo_id = str(bill_obj.get("Id", ""))
+        logger.info(
+            "Created QuickBooks Bill Id='%s' (DocNumber='%s') for VendorRef='%s'",
+            qbo_id,
+            bill_obj.get("DocNumber"),
+            vendor_id,
+        )
+        return bill_obj
 
     @staticmethod
     def _format_qbo_line_item(raw_item: dict[str, Any], index: int) -> dict[str, Any]:

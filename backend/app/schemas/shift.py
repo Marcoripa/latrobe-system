@@ -9,7 +9,7 @@ ShiftCategory = Literal["Travel", "On-Site", "Shed/Prep"]
 class ShiftItemUsed(BaseModel):
     """Material or inventory part consumed during a shift."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     item_id: str = Field(..., min_length=1, description="Firestore inventory item ID")
     sku: str = Field(..., min_length=1, description="Part SKU or QuickBooks item code")
@@ -23,12 +23,21 @@ class ShiftItemUsed(BaseModel):
 class ShiftLogCreate(BaseModel):
     """Payload for logging an operator shift."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
     project_id: str = Field(..., min_length=1, description="Target project ID")
     operator_id: str = Field(..., min_length=1, description="Operator Firebase UID")
-    ute_id: str | None = Field(
-        default=None, description="Optional Ute ID override for stock deduction"
+    operator_name: str | None = Field(
+        default=None,
+        description="Display name of the operator who logged the shift (e.g. 'Andrew', 'Marco Ripa')",
+    )
+    operator_email: str | None = Field(
+        default=None,
+        description="Email address of the operator who logged the shift",
+    )
+    logged_by: str | None = Field(
+        default=None,
+        description="Human-readable name/email of the operator who logged the shift",
     )
     hours: float = Field(..., gt=0, le=24, description="Total hours worked in shift")
     category: ShiftCategory = Field(

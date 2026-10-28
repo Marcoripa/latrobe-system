@@ -23,6 +23,7 @@ class UserContext(BaseModel):
 
     uid: str
     email: str | None = None
+    name: str | None = None
     role: RoleType = "operator"
     claims: dict[str, Any] = Field(default_factory=dict)
 
@@ -128,10 +129,25 @@ async def get_current_user(
         )
 
     role = _extract_role(decoded_token)
+    display_name = decoded_token.get("name") or decoded_token.get("display_name")
+    email_val = decoded_token.get("email")
+
+    if not display_name:
+        try:
+            user_record = auth.get_user(uid)
+            display_name = user_record.display_name
+            if not email_val:
+                email_val = user_record.email
+        except Exception:
+            pass
+
+    if not display_name and email_val:
+        display_name = email_val.split("@")[0]
 
     return UserContext(
         uid=uid,
-        email=decoded_token.get("email"),
+        email=email_val,
+        name=display_name,
         role=role,
         claims=decoded_token,
     )

@@ -108,10 +108,15 @@ class SyncService:
                 cust_data: dict[str, Any] = {
                     "qbo_id": rec["qbo_id"],
                     "qbo_customer_id": rec["qbo_id"],
+                    "customer_id": rec["qbo_id"],
                     "display_name": rec["display_name"],
                     "name": rec["display_name"],
                     "fully_qualified_name": rec.get("fully_qualified_name"),
                     "company_name": rec.get("company_name"),
+                    "email": rec.get("email"),
+                    "phone": rec.get("phone"),
+                    "mobile": rec.get("mobile"),
+                    "overdue_balance": rec.get("overdue_balance", 0.0),
                     "active": True,
                     "synced_at": now,
                     "source": "quickbooks",
@@ -230,11 +235,50 @@ class SyncService:
             )
 
         written = await self._batch_upsert("catalog_items", docs)
+        self._fs.invalidate_materials_cache()
         logger.info("QBO sync: upserted %d catalog item(s).", written)
         return {"catalog_items": written}
 
+    async def sync_qbo_suppliers(self) -> dict[str, int]:
+        """Fetch active QBO Vendors and upsert them into Firestore `suppliers` collection."""
+        vendors = await self._qbo.fetch_active_vendors()
+        now = datetime.now(timezone.utc)
+
+        docs: list[tuple[str, dict[str, Any]]] = []
+        for vendor in vendors:
+            vid = vendor["vendor_id"]
+            email_addr = vendor.get("email_address")
+            email_domain = vendor.get("email_domain")
+            if not email_domain and email_addr and "@" in email_addr:
+                email_domain = email_addr.split("@", 1)[1].strip().lower() or None
+
+            docs.append(
+                (
+                    vid,
+                    {
+                        "id": vid,
+                        "vendor_id": vid,
+                        "qbo_id": vid,
+                        "display_name": vendor["display_name"],
+                        "company_name": vendor.get("company_name"),
+                        "email_address": email_addr,
+                        "email_domain": email_domain,
+                        "email_addresses": vendor.get("email_addresses") or [],
+                        "active": True,
+                        "synced_at": now,
+                        "source": "quickbooks",
+                    },
+                )
+            )
+
+        written = await self._batch_upsert("suppliers", docs)
+        if hasattr(self._fs, "invalidate_suppliers_cache"):
+            self._fs.invalidate_suppliers_cache()
+        logger.info("QBO sync: upserted %d supplier(s).", written)
+        return {"suppliers": written}
+
     async def run_full_sync(self) -> dict[str, Any]:
-        """Run customers/projects then items sequentially. Skips if a sync is already running."""
+        """Run customers/projects, items, and suppliers sequentially. Skips if a sync is already running."""
         if self._lock.locked():
             logger.info("QBO sync already in progress; skipping this trigger.")
             return {"skipped": True}
@@ -243,6 +287,7 @@ class SyncService:
             summary: dict[str, Any] = {}
             try:
                 summary.update(await self.sync_qbo_customers_and_projects())
+                self._fs.invalidate_projects_cache()
             except Exception:
                 logger.exception("QBO customers/projects sync failed.")
                 summary["customers_projects_error"] = True
@@ -251,6 +296,11 @@ class SyncService:
             except Exception:
                 logger.exception("QBO items sync failed.")
                 summary["items_error"] = True
+            try:
+                summary.update(await self.sync_qbo_suppliers())
+            except Exception:
+                logger.exception("QBO suppliers sync failed.")
+                summary["suppliers_error"] = True
             return summary
 
 

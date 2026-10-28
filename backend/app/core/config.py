@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     LLM_MODEL: str = "gemini-3.8-flash"
 
+    # Gmail IMAP / SMTP Integration
+    GMAIL_ADDRESS: str = ""
+    GMAIL_APP_PASSWORD: str = ""
+    GMAIL_IMAP_HOST: str = "imap.gmail.com"
+    GMAIL_SMTP_HOST: str = "smtp.gmail.com"
+    GMAIL_SMTP_PORT: int = 587
+
     @field_validator("TELEGRAM_USER_IDS", mode="before")
     @classmethod
     def assemble_telegram_user_ids(cls, v: Any) -> list[int]:

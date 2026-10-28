@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,8 +30,73 @@ class FirestoreServiceError(Exception):
 class FirestoreService:
     """Asynchronous wrapper around the Firebase Admin Firestore client."""
 
+    CACHE_TTL_SECONDS: float = 60.0
+
     def __init__(self) -> None:
         self._db: firestore.Client | None = None
+        self._operator_cache: dict[str, tuple[str | None, str | None]] = {}
+        self._projects_cache: list[dict[str, Any]] | None = None
+        self._projects_cache_ts: float = 0.0
+        self._materials_cache: list[dict[str, Any]] | None = None
+        self._materials_cache_ts: float = 0.0
+        self._suppliers_cache: list[dict[str, Any]] | None = None
+        self._suppliers_cache_ts: float = 0.0
+
+    def invalidate_projects_cache(self) -> None:
+        """Clear the in-memory projects cache."""
+        self._projects_cache = None
+        self._projects_cache_ts = 0.0
+
+    def invalidate_materials_cache(self) -> None:
+        """Clear the in-memory materials cache."""
+        self._materials_cache = None
+        self._materials_cache_ts = 0.0
+
+    def invalidate_suppliers_cache(self) -> None:
+        """Clear the in-memory suppliers cache."""
+        self._suppliers_cache = None
+        self._suppliers_cache_ts = 0.0
+
+    def _get_all_projects_sync(self) -> list[dict[str, Any]]:
+        """Return all projects using a short-lived in-memory TTL cache."""
+        now_mono = time.monotonic()
+        if (
+            self._projects_cache is not None
+            and (now_mono - self._projects_cache_ts) < self.CACHE_TTL_SECONDS
+        ):
+            return self._projects_cache
+
+        col_ref = self.db.collection("projects")
+        projects: list[dict[str, Any]] = []
+        for doc in col_ref.stream():
+            data = doc.to_dict() or {}
+            data["id"] = doc.id
+            projects.append(data)
+        self._projects_cache = projects
+        self._projects_cache_ts = time.monotonic()
+        return projects
+
+    def _resolve_operator_info(self, uid: str | None) -> tuple[str | None, str | None]:
+        """Resolve (display_name, email) from Firebase Auth for a given operator UID."""
+        clean_uid = str(uid or "").strip()
+        if not clean_uid or clean_uid == "anonymous-operator":
+            return None, None
+        if clean_uid in self._operator_cache:
+            return self._operator_cache[clean_uid]
+        try:
+            from firebase_admin import auth as fb_auth
+
+            initialize_firebase()
+            user_rec = fb_auth.get_user(clean_uid)
+            name = user_rec.display_name or (
+                user_rec.email.split("@")[0] if user_rec.email else None
+            )
+            email = user_rec.email
+            self._operator_cache[clean_uid] = (name, email)
+            return name, email
+        except Exception:
+            self._operator_cache[clean_uid] = (None, None)
+            return None, None
 
     @property
     def db(self) -> firestore.Client:
@@ -61,6 +127,7 @@ class FirestoreService:
             doc_ref = self.db.collection("projects").document()
             doc_ref.set(payload)
             payload["id"] = doc_ref.id
+            self.invalidate_projects_cache()
             return payload
 
         try:
@@ -82,20 +149,19 @@ class FirestoreService:
         effective_status = status if status is not None else status_filter
 
         def _fetch_all() -> list[dict[str, Any]]:
-            col_ref = self.db.collection("projects")
-            query: Any = (
-                col_ref.where(filter=FieldFilter("status", "==", effective_status))
-                if effective_status
-                else col_ref
-            )
+            all_projs = self._get_all_projects_sync()
+            if effective_status:
+                eff_lower = effective_status.lower()
+                filtered = [
+                    dict(p)
+                    for p in all_projs
+                    if str(p.get("status") or "active").lower() == eff_lower
+                ]
+            else:
+                filtered = [dict(p) for p in all_projs]
             if limit is not None:
-                query = query.limit(limit)
-            projects: list[dict[str, Any]] = []
-            for doc in query.stream():
-                data = doc.to_dict() or {}
-                data["id"] = doc.id
-                projects.append(data)
-            return projects
+                return filtered[:limit]
+            return filtered
 
         try:
             return await asyncio.to_thread(_fetch_all)
@@ -111,6 +177,17 @@ class FirestoreService:
         """Fetch a project document by ID from `projects/{project_id}`."""
 
         def _fetch() -> dict[str, Any] | None:
+            # Check warm cache first to avoid unnecessary round-trips on non-ID strings
+            now_mono = time.monotonic()
+            if (
+                self._projects_cache is not None
+                and (now_mono - self._projects_cache_ts) < self.CACHE_TTL_SECONDS
+            ):
+                for p in self._projects_cache:
+                    if p.get("id") == project_id:
+                        return dict(p)
+                return None
+
             doc_ref = self.db.collection("projects").document(project_id)
             snapshot = doc_ref.get()
             if not snapshot.exists:
@@ -145,6 +222,24 @@ class FirestoreService:
                 doc_ref = shifts_col.document()
 
             payload = shift.model_dump()
+            payload.pop("ute_id", None)
+
+            if not payload.get("operator_name") or not payload.get("operator_email"):
+                resolved_name, resolved_email = self._resolve_operator_info(
+                    payload.get("operator_id")
+                )
+                if not payload.get("operator_name") and resolved_name:
+                    payload["operator_name"] = resolved_name
+                if not payload.get("operator_email") and resolved_email:
+                    payload["operator_email"] = resolved_email
+
+            payload["logged_by"] = (
+                payload.get("logged_by")
+                or payload.get("operator_name")
+                or payload.get("operator_email")
+                or payload.get("operator_id")
+            )
+
             payload.update(
                 {
                     "invoiced": False,
@@ -223,6 +318,7 @@ class FirestoreService:
             if extra_fields:
                 updates.update(extra_fields)
             doc_ref.set(updates, merge=True)
+            self.invalidate_projects_cache()
             snapshot = doc_ref.get()
             data = snapshot.to_dict() or {}
             data["id"] = snapshot.id
@@ -249,28 +345,28 @@ class FirestoreService:
         if not clean_id:
             return []
 
-        # 1. Try direct document ID lookup first
-        direct = await self.get_project(clean_id)
-        if direct:
-            return [direct]
-
-        # 2. Search across projects collection
         def _search_projects() -> list[dict[str, Any]]:
+            all_projects = self._get_all_projects_sync()
+
+            # 1. Check direct document ID match first
+            for p in all_projects:
+                if str(p.get("id")) == clean_id:
+                    return [dict(p)]
+
             needle = clean_id.lower()
             normalized_needle = (
                 needle.replace("project", "").replace("job", "").strip() or needle
             )
             alnum_needle = re.sub(r"[^a-z0-9]", "", normalized_needle)
-            projects_ref = self.db.collection("projects")
             exact_matches: list[dict[str, Any]] = []
             partial_matches: list[dict[str, Any]] = []
 
-            for doc in projects_ref.stream():
-                data = doc.to_dict() or {}
-                data["id"] = doc.id
+            for p in all_projects:
+                data = dict(p)
+                doc_id = str(data.get("id") or "")
                 doc_name = str(data.get("name") or "").lower()
                 client_name = str(data.get("client_name") or "").lower()
-                doc_id_lower = doc.id.lower()
+                doc_id_lower = doc_id.lower()
                 alnum_doc_name = re.sub(r"[^a-z0-9]", "", doc_name)
                 alnum_client_name = re.sub(r"[^a-z0-9]", "", client_name)
 
@@ -377,16 +473,37 @@ class FirestoreService:
         billed_hours = 0.0
         unbilled_shifts_count = 0
         hours_by_category: dict[str, float] = {}
+        hours_by_operator: dict[str, float] = {}
         items_map: dict[str, dict[str, Any]] = {}
         field_notes: list[dict[str, Any]] = []
+        shift_logs: list[dict[str, Any]] = []
 
         for s in shifts:
             hrs = float(s.get("hours") or 0.0)
             cat = str(s.get("category") or "On-Site")
             is_invoiced = bool(s.get("invoiced"))
+            op_id = str(s.get("operator_id") or "")
+            op_name = s.get("operator_name") or s.get("logged_by")
+            op_email = s.get("operator_email")
+            if not op_name and op_id:
+                op_name, resolved_email = await asyncio.to_thread(
+                    self._resolve_operator_info, op_id
+                )
+                op_email = op_email or resolved_email
+            logged_by = str(op_name or op_email or op_id or "Unknown Operator")
+
+            created_at = s.get("created_at")
+            ts_str = (
+                created_at.isoformat()
+                if hasattr(created_at, "isoformat")
+                else str(created_at or "")
+            )
 
             total_hours += hrs
             hours_by_category[cat] = round(hours_by_category.get(cat, 0.0) + hrs, 2)
+            hours_by_operator[logged_by] = round(
+                hours_by_operator.get(logged_by, 0.0) + hrs, 2
+            )
 
             if is_invoiced:
                 billed_hours += hrs
@@ -394,6 +511,7 @@ class FirestoreService:
                 unbilled_hours += hrs
                 unbilled_shifts_count += 1
 
+            shift_items: list[dict[str, Any]] = []
             # Aggregate items/materials used across shifts
             for item in s.get("items_used") or []:
                 if not isinstance(item, dict):
@@ -407,6 +525,13 @@ class FirestoreService:
                 qty = float(item.get("quantity") or 0.0)
                 if qty <= 0:
                     continue
+                shift_items.append(
+                    {
+                        "sku": sku,
+                        "name": str(item.get("name") or sku),
+                        "quantity": qty,
+                    }
+                )
                 if sku not in items_map:
                     items_map[sku] = {
                         "item_id": item.get("item_id"),
@@ -423,24 +548,39 @@ class FirestoreService:
                         items_map[sku]["unbilled_quantity"] + qty, 2
                     )
 
-            # Collect operator field notes
             note_text = str(s.get("notes") or "").strip()
-            if note_text and note_text.lower() != "none":
-                created_at = s.get("created_at")
-                ts_str = (
-                    created_at.isoformat()
-                    if hasattr(created_at, "isoformat")
-                    else str(created_at or "")
-                )
+            clean_note = note_text if (note_text and note_text.lower() != "none") else None
+
+            shift_logs.append(
+                {
+                    "shift_id": s.get("id"),
+                    "date": ts_str,
+                    "logged_by": logged_by,
+                    "operator_name": op_name or logged_by,
+                    "operator_email": op_email,
+                    "operator_id": op_id,
+                    "category": cat,
+                    "hours": hrs,
+                    "items_used": shift_items,
+                    "notes": clean_note,
+                    "invoiced": is_invoiced,
+                }
+            )
+
+            # Collect operator field notes
+            if clean_note:
                 field_notes.append(
                     {
                         "date": ts_str,
+                        "logged_by": logged_by,
                         "category": cat,
                         "hours": hrs,
-                        "note": note_text,
+                        "note": clean_note,
                         "invoiced": is_invoiced,
                     }
                 )
+
+        shift_logs.sort(key=lambda x: str(x.get("date") or ""))
 
         return {
             "found": True,
@@ -455,11 +595,134 @@ class FirestoreService:
             "unbilled_hours": round(unbilled_hours, 2),
             "billed_hours": round(billed_hours, 2),
             "hours_by_category": hours_by_category,
+            "hours_by_operator": hours_by_operator,
             "shifts_count": len(shifts),
             "unbilled_shifts_count": unbilled_shifts_count,
+            "shifts": shift_logs[-30:],
             "items_used": list(items_map.values()),
             "items_used_count": len(items_map),
             "field_notes": field_notes[-20:],
+        }
+
+    async def get_shifts_activity(
+        self,
+        project_identifier: str | None = None,
+        operator_query: str | None = None,
+        limit: int = 30,
+    ) -> dict[str, Any]:
+        """Query shift logs to track who did what and when, filtered by project and/or operator."""
+        target_project_id: str | None = None
+        project_map: dict[str, str] = {}
+
+        if project_identifier and project_identifier.strip():
+            matches = await self.find_matching_projects(project_identifier)
+            if not matches:
+                return {
+                    "found": False,
+                    "error": f"Project '{project_identifier}' was not found.",
+                }
+            if len(matches) > 1:
+                return {
+                    "found": False,
+                    "ambiguous": True,
+                    "candidates": [
+                        {
+                            "project_id": str(m.get("id")),
+                            "name": m.get("name"),
+                            "client_name": m.get("client_name"),
+                        }
+                        for m in matches
+                    ],
+                }
+            target_project_id = str(matches[0].get("id"))
+            project_map[target_project_id] = str(matches[0].get("name") or target_project_id)
+        else:
+            all_projs = await self.list_projects()
+            for p in all_projs:
+                project_map[str(p.get("id"))] = str(p.get("name") or p.get("id"))
+
+        def _fetch_shifts() -> list[dict[str, Any]]:
+            col = self.db.collection("shifts")
+            query: Any = (
+                col.where(filter=FieldFilter("project_id", "==", target_project_id))
+                if target_project_id
+                else col
+            )
+            raw_list: list[dict[str, Any]] = []
+            for doc in query.stream():
+                d = doc.to_dict() or {}
+                d["id"] = doc.id
+                raw_list.append(d)
+            return raw_list
+
+        raw_shifts = await asyncio.to_thread(_fetch_shifts)
+        op_needle = (operator_query or "").strip().lower()
+        results: list[dict[str, Any]] = []
+
+        for s in raw_shifts:
+            op_id = str(s.get("operator_id") or "")
+            op_name = s.get("operator_name") or s.get("logged_by")
+            op_email = s.get("operator_email")
+            if not op_name and op_id:
+                op_name, resolved_email = await asyncio.to_thread(
+                    self._resolve_operator_info, op_id
+                )
+                op_email = op_email or resolved_email
+            logged_by = str(op_name or op_email or op_id or "Unknown Operator")
+
+            if op_needle:
+                haystack = " ".join(
+                    [
+                        logged_by.lower(),
+                        str(op_name or "").lower(),
+                        str(op_email or "").lower(),
+                        op_id.lower(),
+                    ]
+                )
+                if op_needle not in haystack:
+                    continue
+
+            created_at = s.get("created_at")
+            ts_str = (
+                created_at.isoformat()
+                if hasattr(created_at, "isoformat")
+                else str(created_at or "")
+            )
+            pid = str(s.get("project_id") or "")
+            results.append(
+                {
+                    "shift_id": s.get("id"),
+                    "date": ts_str,
+                    "project_id": pid,
+                    "project_name": project_map.get(pid, pid),
+                    "logged_by": logged_by,
+                    "operator_name": op_name or logged_by,
+                    "operator_email": op_email,
+                    "operator_id": op_id,
+                    "category": str(s.get("category") or "On-Site"),
+                    "hours": float(s.get("hours") or 0.0),
+                    "items_used": [
+                        {
+                            "sku": item.get("sku"),
+                            "name": item.get("name"),
+                            "quantity": item.get("quantity"),
+                        }
+                        for item in (s.get("items_used") or [])
+                        if isinstance(item, dict)
+                    ],
+                    "notes": s.get("notes"),
+                    "invoiced": bool(s.get("invoiced")),
+                }
+            )
+
+        results.sort(key=lambda x: str(x.get("date") or ""), reverse=True)
+        total_hours = round(sum(r["hours"] for r in results), 2)
+
+        return {
+            "found": True,
+            "total_matching_shifts": len(results),
+            "total_hours": total_hours,
+            "shifts": results[:limit],
         }
 
     async def list_active_projects(self) -> dict[str, Any]:
@@ -618,28 +881,36 @@ class FirestoreService:
                         "Vector search fallback to text search: %s", vec_exc
                     )
 
-            # 2. Load materials from `materials` and `inventory` collections
-            for col_name in ("materials", "catalog_items", "inventory"):
-                try:
-                    for doc in self.db.collection(col_name).stream():
-                        raw = doc.to_dict() or {}
-                        item_id = str(raw.get("item_id") or doc.id)
-                        catalog_by_id[item_id] = {
-                            "id": item_id,
-                            "item_id": item_id,
-                            "sku": str(raw.get("sku") or item_id.upper()),
-                            "name": str(raw.get("name") or item_id),
-                            "unit": str(raw.get("unit") or "Units"),
-                            "unit_price": float(raw.get("unit_price") or 0.0),
-                        }
-                except Exception as col_exc:
-                    logger.debug(
-                        "Skipping collection '%s' during material search: %s",
-                        col_name,
-                        col_exc,
-                    )
-
-            all_items = list(catalog_by_id.values())
+            # 2. Load materials from `materials` and `inventory` collections (with 60s TTL cache)
+            now_mono = time.monotonic()
+            if (
+                self._materials_cache is not None
+                and (now_mono - self._materials_cache_ts) < self.CACHE_TTL_SECONDS
+            ):
+                all_items = self._materials_cache
+            else:
+                for col_name in ("materials", "catalog_items", "inventory"):
+                    try:
+                        for doc in self.db.collection(col_name).stream():
+                            raw = doc.to_dict() or {}
+                            item_id = str(raw.get("item_id") or doc.id)
+                            catalog_by_id[item_id] = {
+                                "id": item_id,
+                                "item_id": item_id,
+                                "sku": str(raw.get("sku") or item_id.upper()),
+                                "name": str(raw.get("name") or item_id),
+                                "unit": str(raw.get("unit") or "Units"),
+                                "unit_price": float(raw.get("unit_price") or 0.0),
+                            }
+                    except Exception as col_exc:
+                        logger.debug(
+                            "Skipping collection '%s' during material search: %s",
+                            col_name,
+                            col_exc,
+                        )
+                all_items = list(catalog_by_id.values())
+                self._materials_cache = all_items
+                self._materials_cache_ts = time.monotonic()
             q_clean = query.strip().lower()
             if not q_clean:
                 return all_items[:limit]
@@ -716,6 +987,7 @@ class FirestoreService:
 
             doc_ref = self.db.collection("materials").document(slug)
             doc_ref.set(doc_data, merge=True)
+            self.invalidate_materials_cache()
             return doc_data
 
         try:
@@ -920,6 +1192,344 @@ class FirestoreService:
             logger.warning(
                 "Could not persist QuickBooks tokens to Firestore: %s", exc
             )
+
+    @staticmethod
+    def _normalize_phone(raw_phone: str) -> str:
+        """Normalize phone strings for comparison (handles +61 vs 04 prefixes)."""
+        digits = re.sub(r"\D", "", raw_phone or "")
+        if digits.startswith("61") and len(digits) >= 11:
+            return digits[2:]
+        if digits.startswith("0") and len(digits) >= 10:
+            return digits[1:]
+        return digits
+
+    async def find_customer_by_sender(
+        self, sender_id: str
+    ) -> dict[str, Any] | None:
+        """Look up a customer profile in Firestore `customers` collection by phone, email, or ID."""
+        cleaned = (sender_id or "").strip()
+        if not cleaned:
+            return None
+
+        needle_lower = " ".join(cleaned.lower().split())
+        needle_alnum = re.sub(r"[^a-z0-9]", "", needle_lower)
+        needle_phone = self._normalize_phone(cleaned)
+
+        def _lookup() -> dict[str, Any] | None:
+            col = self.db.collection("customers")
+            # 1. Direct document ID check
+            direct_doc = col.document(cleaned).get()
+            if direct_doc.exists:
+                d = direct_doc.to_dict() or {}
+                d["id"] = direct_doc.id
+                return d
+
+            # 2. Scan customers collection for matching email, phone, mobile, or name
+            for doc in col.stream():
+                data = doc.to_dict() or {}
+                data["id"] = doc.id
+
+                doc_email = str(data.get("email") or "").strip().lower()
+                doc_name = " ".join(
+                    str(data.get("display_name") or data.get("name") or "").lower().split()
+                )
+                doc_name_alnum = re.sub(r"[^a-z0-9]", "", doc_name)
+                doc_qbo_id = str(data.get("qbo_id") or data.get("customer_id") or doc.id).strip().lower()
+
+                if needle_lower and (
+                    needle_lower in (doc_email, doc_name, doc_qbo_id)
+                    or (needle_alnum and len(needle_alnum) >= 4 and needle_alnum == doc_name_alnum)
+                ):
+                    return data
+
+                # Phone/mobile comparison
+                if needle_phone and len(needle_phone) >= 7:
+                    for field in ("phone", "mobile", "sender_id"):
+                        val = str(data.get(field) or "")
+                        norm_val = self._normalize_phone(val)
+                        if norm_val and (
+                            norm_val == needle_phone
+                            or norm_val.endswith(needle_phone)
+                            or needle_phone.endswith(norm_val)
+                        ):
+                            return data
+            return None
+
+        try:
+            return await asyncio.to_thread(_lookup)
+        except Exception as exc:
+            logger.error("Error looking up customer for sender_id '%s': %s", sender_id, exc)
+            return None
+
+    async def get_customer_projects(
+        self, customer_id: str
+    ) -> list[dict[str, Any]]:
+        """Retrieve all projects linked to a given QBO/Firestore customer_id."""
+        clean_cid = str(customer_id or "").strip()
+        if not clean_cid:
+            return []
+
+        def _fetch() -> list[dict[str, Any]]:
+            col = self.db.collection("projects")
+            results: dict[str, dict[str, Any]] = {}
+            for field in ("client_id", "parent_customer_id", "qbo_customer_id"):
+                for doc in col.where(filter=FieldFilter(field, "==", clean_cid)).stream():
+                    d = doc.to_dict() or {}
+                    d["id"] = doc.id
+                    results[doc.id] = d
+            return list(results.values())
+
+        try:
+            return await asyncio.to_thread(_fetch)
+        except Exception as exc:
+            logger.warning("Error fetching projects for customer '%s': %s", customer_id, exc)
+            return []
+
+    async def save_booking_proposal(
+        self, proposal_id: str, proposal_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Save a pending Human-in-the-Loop booking proposal in `booking_proposals/{proposal_id}`."""
+
+        def _save() -> dict[str, Any]:
+            now = datetime.now(timezone.utc)
+            payload = dict(proposal_data)
+            payload["proposal_id"] = proposal_id
+            payload.setdefault("status", "pending_approval")
+            payload["created_at"] = now
+            payload["updated_at"] = now
+            self.db.collection("booking_proposals").document(proposal_id).set(payload, merge=True)
+            return payload
+
+        try:
+            return await asyncio.to_thread(_save)
+        except Exception as exc:
+            logger.error("Error saving booking proposal '%s': %s", proposal_id, exc)
+            raise FirestoreServiceError(f"Failed to save booking proposal: {exc}") from exc
+
+    async def get_booking_proposal(
+        self, proposal_id: str
+    ) -> dict[str, Any] | None:
+        """Retrieve a booking proposal from `booking_proposals/{proposal_id}`."""
+
+        def _get() -> dict[str, Any] | None:
+            doc = self.db.collection("booking_proposals").document(proposal_id).get()
+            if not doc.exists:
+                return None
+            data = doc.to_dict() or {}
+            data["proposal_id"] = doc.id
+            return data
+
+        try:
+            return await asyncio.to_thread(_get)
+        except Exception as exc:
+            logger.error("Error reading booking proposal '%s': %s", proposal_id, exc)
+            raise FirestoreServiceError(f"Failed to read booking proposal: {exc}") from exc
+
+    async def update_booking_proposal(
+        self, proposal_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Update a booking proposal document in `booking_proposals/{proposal_id}`."""
+
+        def _update() -> dict[str, Any]:
+            now = datetime.now(timezone.utc)
+            doc_ref = self.db.collection("booking_proposals").document(proposal_id)
+            payload = dict(updates)
+            payload["updated_at"] = now
+            doc_ref.set(payload, merge=True)
+            snap = doc_ref.get()
+            data = snap.to_dict() or {}
+            data["proposal_id"] = snap.id
+            return data
+
+        try:
+            return await asyncio.to_thread(_update)
+        except Exception as exc:
+            logger.error("Error updating booking proposal '%s': %s", proposal_id, exc)
+            raise FirestoreServiceError(f"Failed to update booking proposal: {exc}") from exc
+
+    async def create_project_booking(
+        self,
+        project_id: str,
+        booking_data: dict[str, Any],
+        booking_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a confirmed booking document under `projects/{project_id}/bookings/{booking_id}`."""
+        target_project_id = str(project_id or "unassigned").strip() or "unassigned"
+
+        def _create() -> dict[str, Any]:
+            now = datetime.now(timezone.utc)
+            bookings_col = (
+                self.db.collection("projects")
+                .document(target_project_id)
+                .collection("bookings")
+            )
+            doc_ref = (
+                bookings_col.document(booking_id)
+                if booking_id
+                else bookings_col.document()
+            )
+            payload = dict(booking_data)
+            payload.update(
+                {
+                    "booking_id": doc_ref.id,
+                    "project_id": target_project_id,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            doc_ref.set(payload, merge=True)
+            return payload
+
+        try:
+            return await asyncio.to_thread(_create)
+        except Exception as exc:
+            logger.error(
+                "Error creating booking under projects/%s/bookings: %s",
+                target_project_id,
+                exc,
+            )
+            raise FirestoreServiceError(
+                f"Failed to create booking for project '{target_project_id}': {exc}"
+            ) from exc
+
+    async def list_pending_booking_proposals(self) -> list[dict[str, Any]]:
+        """Retrieve all booking proposals currently in `pending_approval` status
+        so concurrent incoming requests do not propose overlapping time slots.
+        """
+
+        def _list_pending() -> list[dict[str, Any]]:
+            col = self.db.collection("booking_proposals")
+            query = col.where(filter=FieldFilter("status", "==", "pending_approval"))
+            results: list[dict[str, Any]] = []
+            for doc in query.stream():
+                d = doc.to_dict() or {}
+                d["proposal_id"] = doc.id
+                results.append(
+                    {
+                        "proposal_id": doc.id,
+                        "customer_name": d.get("customer_name"),
+                        "project_name": d.get("project_name"),
+                        "summary": d.get("summary"),
+                        "start_iso": d.get("start_iso"),
+                        "end_iso": d.get("end_iso"),
+                        "proposed_slot": d.get("proposed_slot"),
+                    }
+                )
+            return results
+
+        try:
+            return await asyncio.to_thread(_list_pending)
+        except Exception as exc:
+            logger.warning("Error listing pending booking proposals: %s", exc)
+            return []
+
+    async def is_email_processed(self, email_key: str) -> bool:
+        """Check whether an email Message-ID / UID key has already been processed."""
+
+        def _check() -> bool:
+            doc = self.db.collection("processed_emails").document(email_key).get()
+            return doc.exists
+
+        try:
+            return await asyncio.to_thread(_check)
+        except Exception as exc:
+            logger.warning("Error checking processed_emails for '%s': %s", email_key, exc)
+            return False
+
+    async def mark_email_processed(
+        self, email_key: str, metadata: dict[str, Any]
+    ) -> None:
+        """Record an email Message-ID / UID key in `processed_emails/{email_key}`."""
+
+        def _mark() -> None:
+            payload = dict(metadata)
+            payload["processed_at"] = datetime.now(timezone.utc)
+            self.db.collection("processed_emails").document(email_key).set(
+                payload, merge=True
+            )
+
+        try:
+            await asyncio.to_thread(_mark)
+        except Exception as exc:
+            logger.warning("Error marking email '%s' as processed: %s", email_key, exc)
+
+    async def list_suppliers(self) -> list[dict[str, Any]]:
+        """Retrieve all active suppliers from Firestore `suppliers` collection (with 60s TTL cache)."""
+
+        def _fetch_suppliers() -> list[dict[str, Any]]:
+            now_mono = time.monotonic()
+            if (
+                self._suppliers_cache is not None
+                and (now_mono - self._suppliers_cache_ts) < self.CACHE_TTL_SECONDS
+            ):
+                return self._suppliers_cache
+
+            col = self.db.collection("suppliers")
+            suppliers: list[dict[str, Any]] = []
+            for doc in col.stream():
+                data = doc.to_dict() or {}
+                data["id"] = doc.id
+                data.setdefault("vendor_id", doc.id)
+                suppliers.append(data)
+            self._suppliers_cache = suppliers
+            self._suppliers_cache_ts = time.monotonic()
+            return suppliers
+
+        try:
+            return await asyncio.to_thread(_fetch_suppliers)
+        except Exception as exc:
+            logger.error("Error listing suppliers from Firestore: %s", exc)
+            return []
+
+    async def save_pending_bill(
+        self, bill_id: str, bill_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Save an extracted supplier invoice pending approval into `pending_bills/{bill_id}`."""
+
+        def _save() -> dict[str, Any]:
+            now = datetime.now(timezone.utc)
+            payload = dict(bill_data)
+            payload["bill_id"] = bill_id
+            payload.setdefault("status", "pending_approval")
+            payload["created_at"] = now
+            payload["updated_at"] = now
+            self.db.collection("pending_bills").document(bill_id).set(payload, merge=True)
+            return payload
+
+        try:
+            return await asyncio.to_thread(_save)
+        except Exception as exc:
+            logger.error("Error saving pending bill '%s': %s", bill_id, exc)
+            raise FirestoreServiceError(f"Failed to save pending bill: {exc}") from exc
+
+    async def get_pending_bill(self, bill_id: str) -> dict[str, Any] | None:
+        """Retrieve a pending bill document from `pending_bills/{bill_id}`."""
+
+        def _get() -> dict[str, Any] | None:
+            doc = self.db.collection("pending_bills").document(bill_id).get()
+            if not doc.exists:
+                return None
+            data = doc.to_dict() or {}
+            data["bill_id"] = doc.id
+            return data
+
+        try:
+            return await asyncio.to_thread(_get)
+        except Exception as exc:
+            logger.error("Error reading pending bill '%s': %s", bill_id, exc)
+            raise FirestoreServiceError(f"Failed to read pending bill: {exc}") from exc
+
+    async def delete_pending_bill(self, bill_id: str) -> None:
+        """Delete a document from `pending_bills/{bill_id}` after approval or rejection."""
+
+        def _delete() -> None:
+            self.db.collection("pending_bills").document(bill_id).delete()
+
+        try:
+            await asyncio.to_thread(_delete)
+        except Exception as exc:
+            logger.error("Error deleting pending bill '%s': %s", bill_id, exc)
+            raise FirestoreServiceError(f"Failed to delete pending bill: {exc}") from exc
 
 
 firestore_service = FirestoreService()

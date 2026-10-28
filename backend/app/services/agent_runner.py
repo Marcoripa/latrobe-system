@@ -1,8 +1,9 @@
+import asyncio
 import html
 import inspect
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,14 +21,15 @@ SYSTEM_PROMPT = (
     "You are the autonomous operations assistant for LaTrobe Irrigation's Telegram bot.\n"
     "Answer operator questions concisely, accurately, and professionally.\n"
     "You have access to tools that query real-time Firestore database records for master materials catalog/stock, "
-    "project status (including hours, shifts, materials/items used, location, and field notes), and Google Calendar management (checking schedule and booking jobs).\n"
+    "project status (including hours by category and by operator, individual shifts with who logged them and when, materials/items used, location, and field notes), "
+    "shift activity logs across projects/operators, and Google Calendar management (checking schedule and booking jobs).\n"
     "When answering user questions, use the tools dynamically. You can call multiple tools or chain multiple tool turns "
     "to answer complex, multi-step queries (e.g. check stock, check calendar availability, and book a job).\n\n"
     "CRITICAL RULES:\n"
     "1. All parts come from master stock. There is NO per-vehicle ('ute') stock tracking.\n"
     "2. Format your response strictly using Telegram HTML tags: <b>bold</b>, <i>italic</i>, <code>code</code>, <a>links</a>.\n"
     "3. Do NOT use Markdown formatting (no asterisks **, no backticks ```). Only use HTML tags supported by Telegram.\n"
-    "4. Dynamically tailor what project information you present based on the user's question: if they ask a targeted question (e.g. only hours or only materials used), return just that relevant info; if they ask for a full review or summary of a project, include all available details (client, location, hours by category, shifts count, materials/items used with quantities, and field notes).\n"
+    "4. Dynamically tailor what project information you present based on the user's question: if they ask a targeted question (e.g. only hours, only materials used, or who logged shifts and when), return just that relevant info; if they ask for a full review or summary of a project, include all available details (client, location, hours by category, hours by operator / who logged the shifts, shifts count, materials/items used with quantities, and field notes).\n"
     "5. CLARIFICATION & UNCERTAINTY POLICY (CRITICAL):\n"
     "   - Whenever a request is ambiguous or uncertain (e.g. `ambiguous: true` is returned with multiple candidate projects, multiple distinct materials match a vague query and the user asked about a single specific item, or a calendar booking request is missing date/time/project details), NEVER guess or silently pick one.\n"
     "   - Instead, clearly list the matching candidate options (or missing fields) and ask the user a concise clarifying question.\n"
@@ -54,7 +56,7 @@ GEMINI_TOOLS_DECLARATIONS = [
             },
             {
                 "name": "get_project_status",
-                "description": "Get comprehensive project details from Firestore, including project ID, client info, site location, status, logged shift hours (total, unbilled, and broken down by category), shifts count, all materials/items used with quantities, and operator field notes.",
+                "description": "Get comprehensive project details from Firestore, including project ID, client info, site location, status, logged shift hours (total, unbilled, broken down by category and by operator), detailed shift records (who logged each shift, when, category, hours, items used, notes), aggregated materials/items used with quantities, and operator field notes.",
                 "parameters": {
                     "type": "OBJECT",
                     "properties": {
@@ -64,6 +66,23 @@ GEMINI_TOOLS_DECLARATIONS = [
                         }
                     },
                     "required": ["project_identifier"],
+                },
+            },
+            {
+                "name": "get_shifts_activity",
+                "description": "Query shift logs from the `shifts` collection to track who did what and when. Can filter by project name/ID, by operator name/email/UID (e.g. 'Andrew', 'Luke', 'Tom', 'Marco'), or list recent shifts across all projects.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "project_identifier": {
+                            "type": "STRING",
+                            "description": "Optional project name or ID to filter shifts by",
+                        },
+                        "operator_query": {
+                            "type": "STRING",
+                            "description": "Optional operator name, email, or UID to filter shifts by (e.g. 'Andrew', 'Luke')",
+                        },
+                    },
                 },
             },
             {
@@ -130,6 +149,7 @@ GEMINI_TOOLS_DECLARATIONS = [
 TOOL_REGISTRY: dict[str, Any] = {
     "search_materials": firestore_service.search_materials,
     "get_project_status": firestore_service.get_project_status,
+    "get_shifts_activity": firestore_service.get_shifts_activity,
     "list_active_projects": firestore_service.list_active_projects,
     "get_calendar_events": calendar_service.get_schedule,
     "book_calendar_job": calendar_service.schedule_job,
@@ -178,6 +198,44 @@ class AgentRunner:
         self.model_name = resolved_model
         self.max_turns = max_turns
         self.timeout = timeout
+        self._http_client: httpx.AsyncClient | None = None
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Return a persistent httpx.AsyncClient for connection pooling and keep-alive."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=self.timeout,
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
+        return self._http_client
+
+    def _build_generation_config(self) -> dict[str, Any]:
+        """Configure low thinking overhead for fast operational tool routing and formatting."""
+        model_lower = (self.model_name or "").lower()
+        if "gemini-3" in model_lower:
+            return {"thinkingConfig": {"thinkingLevel": "LOW"}}
+        if "gemini-2.5" in model_lower:
+            return {"thinkingConfig": {"thinkingBudget": 128}}
+        return {}
+
+    async def _build_active_projects_context(self) -> str:
+        """Build a compact directory of active projects from the cached Firestore service."""
+        try:
+            active_projects = await firestore_service.list_projects(status_filter="active")
+            if not active_projects:
+                return "None currently active."
+            lines: list[str] = []
+            for p in active_projects[:25]:
+                pid = str(p.get("id") or "")
+                name = str(p.get("name") or pid)
+                client = str(p.get("client_name") or "N/A")
+                loc = str(p.get("location") or "")
+                loc_suffix = f", Location: {loc}" if loc else ""
+                lines.append(f"• [ID: {pid}] {name} (Client: {client}{loc_suffix})")
+            return "\n".join(lines)
+        except Exception as exc:
+            logger.debug("Non-critical failure building active projects context: %s", exc)
+            return "Use `list_active_projects` tool if needed."
 
     async def run(
         self,
@@ -188,7 +246,7 @@ class AgentRunner:
         1. Receive user prompt and optional conversation history.
         2. Query Gemini with registered tools.
         3. If model returns terminal text, format and return it.
-        4. If model returns functionCall(s), dynamically execute via TOOL_REGISTRY,
+        4. If model returns functionCall(s), dynamically execute via TOOL_REGISTRY in parallel,
            append functionResponse turns under role 'user', and loop back to reason.
         5. Terminate gracefully on max_turns or unhandled error.
         """
@@ -210,103 +268,125 @@ class AgentRunner:
 
         contents.append({"role": "user", "parts": [{"text": prompt.strip()}]})
 
-        # Dynamically inject local datetime context in Australia/Melbourne
+        # Dynamically inject local datetime context and pre-computed 14-day calendar in Australia/Melbourne
         melbourne_tz = ZoneInfo("Australia/Melbourne")
         now_melbourne = datetime.now(melbourne_tz)
         current_time_str = now_melbourne.strftime("%A, %d %B %Y, %I:%M %p (%Z, %z)")
         current_iso = now_melbourne.isoformat()
+        tz_offset = now_melbourne.strftime("%z")
+        tz_offset_iso = f"{tz_offset[:3]}:{tz_offset[3:]}" if len(tz_offset) == 5 else "+11:00"
+
+        upcoming_days: list[str] = []
+        for offset in range(14):
+            day_dt = now_melbourne + timedelta(days=offset)
+            label = "Today" if offset == 0 else ("Tomorrow" if offset == 1 else day_dt.strftime("%a"))
+            upcoming_days.append(f"{label} ({day_dt.strftime('%a %d %b')}): {day_dt.strftime('%Y-%m-%d')}")
+        calendar_reference_str = " | ".join(upcoming_days)
+
+        active_projects_context = await self._build_active_projects_context()
 
         dynamic_system_prompt = (
             f"{SYSTEM_PROMPT}\n"
+            f"ACTIVE PROJECTS DIRECTORY (Use exact ID or name directly in `get_project_status` / `get_shifts_activity` without calling `list_active_projects` first unless asked to list all projects):\n"
+            f"{active_projects_context}\n\n"
             f"TEMPORAL CONTEXT (CRITICAL):\n"
             f"• The current local date and time in Australia/Melbourne is: {current_time_str}\n"
             f"• Current ISO 8601 timestamp: {current_iso}\n"
-            f"• Time zone: Australia/Melbourne\n"
-            f"Use this exact temporal context to calculate correct dates and times when the operator uses relative terms "
+            f"• Time zone: Australia/Melbourne (UTC offset {tz_offset_iso})\n"
+            f"• Pre-computed 14-Day Calendar Reference: {calendar_reference_str}\n"
+            f"Use this exact temporal context and 14-day reference table to resolve relative terms "
             f"such as 'today', 'tomorrow', 'this afternoon', 'next Monday', or 'next week'. "
-            f"Always supply valid ISO 8601 strings with timezone offset when querying or booking calendar events."
+            f"Always supply valid ISO 8601 strings with timezone offset ({tz_offset_iso}) when querying or booking calendar events."
         )
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            for turn_idx in range(self.max_turns):
-                payload: dict[str, Any] = {
-                    "system_instruction": {"parts": [{"text": dynamic_system_prompt}]},
-                    "contents": contents,
-                    "tools": GEMINI_TOOLS_DECLARATIONS,
-                }
+        client = self._get_http_client()
+        gen_config = self._build_generation_config()
 
-                try:
-                    resp = await client.post(
-                        url,
-                        params={"key": self.api_key},
-                        json=payload,
-                    )
-                except httpx.RequestError as exc:
-                    logger.error("Network error during agent ReAct turn %d: %s", turn_idx + 1, exc)
-                    return (
-                        "⚠️ <b>Network Error:</b> Could not reach AI service. Please check connectivity and try again."
-                    )
+        for turn_idx in range(self.max_turns):
+            payload: dict[str, Any] = {
+                "system_instruction": {"parts": [{"text": dynamic_system_prompt}]},
+                "contents": contents,
+                "tools": GEMINI_TOOLS_DECLARATIONS,
+            }
+            if gen_config:
+                payload["generationConfig"] = gen_config
 
-                if resp.status_code != 200:
-                    logger.error(
-                        "Gemini API returned HTTP %d on turn %d: %s",
-                        resp.status_code,
-                        turn_idx + 1,
-                        resp.text,
-                    )
-                    return (
-                        "⚠️ <b>Service Error:</b> AI reasoning service encountered an error. Please try again later."
-                    )
-
-                resp_data = resp.json()
-                candidate = resp_data.get("candidates", [{}])[0]
-                content = candidate.get("content", {})
-                parts = content.get("parts", [])
-
-                if not parts:
-                    logger.warning("Empty parts returned by Gemini on turn %d: %s", turn_idx + 1, resp_data)
-                    break
-
-                function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
-
-                # Step 3: Terminal text returned without function calls
-                if not function_calls:
-                    text_parts = [p.get("text", "") for p in parts if "text" in p]
-                    final_text = "".join(text_parts).strip()
-                    if final_text:
-                        return final_text
-                    break
-
-                # Step 4: Model requested one or more tool calls
-                logger.info(
-                    "ReAct Turn %d: Agent requested tool calls: %s",
-                    turn_idx + 1,
-                    [fc.get("name") for fc in function_calls],
+            try:
+                resp = await client.post(
+                    url,
+                    params={"key": self.api_key},
+                    json=payload,
+                )
+            except httpx.RequestError as exc:
+                logger.error("Network error during agent ReAct turn %d: %s", turn_idx + 1, exc)
+                return (
+                    "⚠️ <b>Network Error:</b> Could not reach AI service. Please check connectivity and try again."
                 )
 
-                # Append model turn preserving thought signatures, function calls, and parts
-                contents.append({"role": "model", "parts": parts})
+            if resp.status_code != 200:
+                logger.error(
+                    "Gemini API returned HTTP %d on turn %d: %s",
+                    resp.status_code,
+                    turn_idx + 1,
+                    resp.text,
+                )
+                return (
+                    "⚠️ <b>Service Error:</b> AI reasoning service encountered an error. Please try again later."
+                )
 
-                # Execute all requested functions dynamically
-                fn_response_parts: list[dict[str, Any]] = []
-                for fc in function_calls:
-                    tool_name = fc.get("name", "")
-                    tool_args = fc.get("args") or {}
-                    call_id = fc.get("id")
+            resp_data = resp.json()
+            candidate = resp_data.get("candidates", [{}])[0]
+            content = candidate.get("content", {})
+            parts = content.get("parts", [])
 
-                    tool_result = await execute_tool(tool_name, tool_args)
+            if not parts:
+                logger.warning("Empty parts returned by Gemini on turn %d: %s", turn_idx + 1, resp_data)
+                break
 
-                    part_dict: dict[str, Any] = {
-                        "name": tool_name,
-                        "response": tool_result,
-                    }
-                    if call_id:
-                        part_dict["id"] = call_id
+            function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
 
-                    fn_response_parts.append({"functionResponse": part_dict})
+            # Step 3: Terminal text returned without function calls
+            if not function_calls:
+                text_parts = [p.get("text", "") for p in parts if "text" in p]
+                final_text = "".join(text_parts).strip()
+                if final_text:
+                    return final_text
+                break
 
-                # Append function responses under role 'user' (required by Gemini Content spec)
-                contents.append({"role": "user", "parts": fn_response_parts})
+            # Step 4: Model requested one or more tool calls
+            logger.info(
+                "ReAct Turn %d: Agent requested tool calls: %s",
+                turn_idx + 1,
+                [fc.get("name") for fc in function_calls],
+            )
+
+            # Append model turn preserving thought signatures, function calls, and parts
+            contents.append({"role": "model", "parts": parts})
+
+            # Execute all requested functions concurrently
+            tool_results = await asyncio.gather(
+                *(
+                    execute_tool(fc.get("name", ""), fc.get("args") or {})
+                    for fc in function_calls
+                )
+            )
+
+            fn_response_parts: list[dict[str, Any]] = []
+            for fc, tool_result in zip(function_calls, tool_results):
+                tool_name = fc.get("name", "")
+                call_id = fc.get("id")
+
+                part_dict: dict[str, Any] = {
+                    "name": tool_name,
+                    "response": tool_result,
+                }
+                if call_id:
+                    part_dict["id"] = call_id
+
+                fn_response_parts.append({"functionResponse": part_dict})
+
+            # Append function responses under role 'user' (required by Gemini Content spec)
+            contents.append({"role": "user", "parts": fn_response_parts})
 
         logger.warning("Agent ReAct loop reached max turns (%d) for prompt: %r", self.max_turns, prompt)
         return (

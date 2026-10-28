@@ -95,11 +95,19 @@ export function buildShiftApiPayload({
   clientShiftId,
 }) {
   const id = clientShiftId || generateClientId();
+  const operatorName =
+    currentUser?.displayName ||
+    (currentUser?.email ? currentUser.email.split('@')[0] : null) ||
+    'Unknown Operator';
+  const operatorEmail = currentUser?.email || null;
+
   return {
     client_shift_id: id,
     project_id: selectedProject?.id || 'unassigned',
     operator_id: currentUser?.uid || 'anonymous-operator',
-    ute_id: selectedProject?.ute_id || selectedProject?.uteId || null,
+    operator_name: operatorName,
+    operator_email: operatorEmail,
+    logged_by: operatorName,
     hours: Number(hours),
     category: category || 'On-Site',
     items_used: itemsUsed.map((item) => ({
